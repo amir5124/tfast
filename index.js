@@ -354,46 +354,41 @@ app.post('/callback', async (req, res) => {
     console.log("-----------------------------------------");
     console.log("🔔 [CALLBACK RECEIVED] Data:", JSON.stringify(req.body));
 
-    // LinkQu mengirim ID unik di partner_reff atau qris_id
     const reffFromCallback = req.body.partner_reff || req.body.qris_id;
 
     try {
-        // 1. Ambil data pesanan dari tabel order_service
+        // 1. Ambil data pesanan
         const [orders] = await db.execute(
-            'SELECT * FROM order_service WHERE order_reff = ?', 
+            'SELECT * FROM order_service WHERE order_reff = ?',
             [reffFromCallback]
         );
-        
-        const orderData = orders[0];
 
+        const orderData = orders[0];
         if (!orderData) {
-            console.warn(`⚠️ Order #${reffFromCallback} tidak ditemukan di database.`);
+            console.warn(`⚠️ Order #${reffFromCallback} tidak ditemukan.`);
             return res.status(404).json({ error: "Order Not Found" });
         }
 
-        // 2. Cek status (Cegah pengiriman notifikasi berulang jika LinkQu kirim callback 2x)
+        // 2. Cek status lunas (Cegah duplikasi)
         if (orderData.order_status === 'PAID') {
-            console.log(`ℹ️ Order #${reffFromCallback} sudah LUNAS. Melewati pengiriman notifikasi.`);
+            console.log(`ℹ️ Order #${reffFromCallback} sudah LUNAS.`);
             return res.json({ message: "Already Processed" });
         }
 
-        // 3. Update Status di Database (Tabel Log & Tabel Utama)
+        // 3. Update Database
         const methodType = req.body.va_code === 'QRIS' ? 'QRIS' : 'VA';
         const logTable = methodType === 'QRIS' ? 'inquiry_qris' : 'inquiry_va';
 
-        // Update Tabel Log Pembayaran
         await db.execute(
             `UPDATE ${logTable} SET status = 'SUKSES', callback_raw = ?, updated_at = NOW() WHERE partner_reff = ?`,
             [JSON.stringify(req.body), reffFromCallback]
         );
-
-        // Update Tabel Utama order_service
         await db.execute(
             `UPDATE order_service SET order_status = 'PAID', updated_at = NOW() WHERE order_reff = ?`,
             [reffFromCallback]
         );
 
-        // 4. Olah Jasa Tambahan (Parsing LongText JSON)
+        // 4. Olah Data Detail & Format Tanggal (Fix: Rabu, 28 Jan 2026)
         let detailJasa = "-";
         if (orderData.extra_services) {
             try {
@@ -402,53 +397,100 @@ app.post('/callback', async (req, res) => {
             } catch (e) { detailJasa = "-"; }
         }
 
-        // Format Rupiah (Jika fungsi formatIDR Anda sudah ada)
-        const totalFormatted = new Intl.NumberFormat('id-ID', { style: 'currency', currency: 'IDR', minimumFractionDigits: 0 }).format(orderData.total_amount);
+        const totalFormatted = new Intl.NumberFormat('id-ID', {
+            style: 'currency', currency: 'IDR', minimumFractionDigits: 0
+        }).format(orderData.total_amount);
 
-        // 5. Siapkan Variabel WhatsApp (Sesuai Placeholder {{1}} - {{7}} di Twilio)
+        // Format Tanggal Indonesia: "Rabu, 28 Jan 2026"
+        const tglJadwal = moment(orderData.schedule_date).locale('id').format('dddd, DD MMM YYYY');
+        const waktuJadwal = `${tglJadwal} pukul ${orderData.schedule_time} WIB`;
+
+        // 5. Siapkan Variabel WhatsApp
         const waVariables = {
             "1": String(orderData.customer_name),
             "2": String(orderData.order_reff),
             "3": String(orderData.service_name),
             "4": String(detailJasa),
-            "5": String(moment(orderData.schedule_date).format('DD MMM YYYY')), // Format: 25 Jan 2026
+            "5": String(tglJadwal),
             "6": String(orderData.schedule_time),
             "7": String(totalFormatted)
         };
 
+        // --- TEMPLATE EMAIL E-RECEIPT ---
+        // --- TEMPLATE EMAIL E-RECEIPT ---
+        const emailHtml = `
+<div style="font-family: sans-serif; color: #333; max-width: 600px; margin: auto; border: 1px solid #eee; padding: 20px; border-radius: 15px;">
+    <div style="text-align: center; margin-bottom: 20px;">
+        <div style="background: #22c55e; width: 60px; height: 60px; line-height: 60px; border-radius: 50%; color: white; font-size: 30px; margin: 0 auto 10px;">✓</div>
+        <h2 style="color: #22c55e; margin: 0;">PEMBAYARAN BERHASIL</h2>
+        <p style="font-size: 14px; color: #666;">Terima kasih, pembayaran Anda telah kami terima.</p>
+    </div>
+
+    <div style="border-top: 2px dashed #eee; border-bottom: 2px dashed #eee; padding: 15px 0; margin: 20px 0;">
+        <table style="width: 100%; font-size: 14px;">
+            <tr><td style="color: #999;">No. Referensi</td><td style="text-align: right; font-weight: bold;">${orderData.order_reff}</td></tr>
+            <tr><td style="color: #999;">Metode Pembayaran</td><td style="text-align: right;">${orderData.payment_method}</td></tr>
+            <tr><td style="color: #999;">Tanggal Bayar</td><td style="text-align: right;">${moment().locale('id').format('DD MMMM YYYY, HH:mm')} WIB</td></tr>
+        </table>
+    </div>
+
+    <h3 style="font-size: 16px; border-bottom: 1px solid #eee; padding-bottom: 10px;">Detail Layanan</h3>
+    <table style="width: 100%; border-collapse: collapse; font-size: 14px;">
+        <tr><td style="padding: 8px 0;">Layanan Utama</td><td style="text-align: right; font-weight: bold;">${orderData.service_name}</td></tr>
+        <tr><td style="padding: 8px 0;">Jasa Tambahan</td><td style="text-align: right;">${detailJasa}</td></tr>
+        <tr><td style="padding: 8px 0;">Jadwal Pelaksanaan</td><td style="text-align: right; font-weight: bold;">${waktuJadwal}</td></tr>
+        <tr><td style="padding: 8px 0;">Lokasi</td><td style="text-align: right; font-size: 12px; color: #666;">${orderData.address}</td></tr>
+        <tr style="font-size: 18px; color: #22c55e;">
+            <td style="padding: 20px 0;"><b>Total Lunas</b></td>
+            <td style="text-align: right; padding: 20px 0;"><b>${totalFormatted}</b></td>
+        </tr>
+    </table>
+
+    <div style="background: #f8fafc; padding: 15px; border-radius: 10px; font-size: 13px; line-height: 1.6; border-left: 4px solid #633594;">
+        <p style="margin: 0; font-weight: bold; color: #633594;">Informasi Selanjutnya:</p>
+        <p style="margin: 5px 0 0;">Petugas kami akan datang sesuai jadwal yang telah ditentukan. Mohon pastikan nomor telepon <b>${orderData.customer_phone}</b> aktif untuk koordinasi lebih lanjut.</p>
+    </div>
+
+    <p style="text-align: center; font-size: 11px; color: #999; margin-top: 25px;">
+        &copy; 2026 <b>TangerangFast</b>. Semua Hak Dilindungi.<br>
+        Ini adalah pesan otomatis, mohon tidak membalas email ini.
+    </p>
+</div>`;
+
         console.log("🚀 Dispatching Notifications...");
 
-        // --- KIRIM WA PELANGGAN ---
+        // --- 1. KIRIM WA PELANGGAN & ADMIN ---
         await sendWhatsAppWithTemplate(orderData.customer_phone, waVariables);
-
-        // --- KIRIM WA ADMIN (Gunakan nomor admin yang terdaftar) ---
         await sendWhatsAppWithTemplate(ADMIN_PHONE, waVariables);
 
-        // --- NOTIFIKASI JAGEL (Full Detail) ---
+        // --- 2. NOTIFIKASI JAGEL (Lengkap) ---
         try {
             await axios.post('https://api.jagel.id/v1/message/send', {
                 apikey: "z4PBduE9ocedWaaTUCKHnOl7C8yokkTB4catk7FMt5U2d4Lmyv",
                 type: 'email',
                 value: orderData.customer_email || ADMIN_EMAIL,
-                content: `✅ PEMBAYARAN BERHASIL!\n\n` +
-                         `Halo ${orderData.customer_name},\n` +
-                         `Pembayaran Ref: ${orderData.order_reff} LUNAS.\n\n` +
-                         `Rincian:\n` +
-                         `- Layanan: ${orderData.service_name}\n` +
-                         `- Tambahan: ${detailJasa}\n` +
-                         `- Jadwal: ${moment(orderData.schedule_date).format('DD MMM YYYY')} | ${orderData.schedule_time}\n` +
-                         `- Total: ${totalFormatted}\n\n` +
-                         `Petugas kami akan segera datang sesuai jadwal.`
+                content: `✅ PEMBAYARAN BERHASIL (LUNAS)\n\n` +
+                    `Halo ${orderData.customer_name},\n` +
+                    `Pesanan ${orderData.order_reff} telah kami terima.\n\n` +
+                    `Rincian Detail:\n` +
+                    `- Layanan: ${orderData.service_name}\n` +
+                    `- Jasa Tambahan: ${detailJasa}\n` +
+                    `- Jadwal: ${waktuJadwal}\n` +
+                    `- Lokasi: ${orderData.address}\n` +
+                    `- Total Bayar: ${totalFormatted}\n\n` +
+                    `Teknisi kami akan datang sesuai jadwal. Terima kasih!`
             });
-        } catch (e) { console.error("❌ Jagel Notif Gagal:", e.message); }
+        } catch (e) { console.error("❌ Jagel Error:", e.message); }
 
-        // --- KIRIM EMAIL KWITANSI (Optional) ---
-        // await sendEmailNotification(orderData.customer_email, `LUNAS #${reffFromCallback}`, "...");
+        // --- 3. KIRIM EMAIL INVOICE ---
+        if (orderData.customer_email) {
+            await sendEmailNotification(orderData.customer_email, `E-Receipt Pembayaran Lunas #${reffFromCallback}`, emailHtml);
+        }
 
         res.json({ status: "SUCCESS" });
 
     } catch (err) {
-        console.error("❌ CALLBACK ERROR:", err.message);
+        console.error("❌ CALLBACK FATAL ERROR:", err.message);
         res.status(500).send("Internal Server Error");
     }
 });
@@ -558,7 +600,7 @@ app.get('/qr-list', async (req, res) => {
 
 app.get('/transaction-history', async (req, res) => {
     const { email } = req.query;
-    
+
     // Validasi input email
     if (!email) {
         return res.status(400).json({ error: "Email is required" });
@@ -600,26 +642,26 @@ app.get('/transaction-history', async (req, res) => {
                 ...order,
                 // Status yang sudah diproses logika expired
                 order_status: status,
-                
+
                 // Format mata uang Rupiah yang rapi
-                formatted_amount: new Intl.NumberFormat('id-ID', { 
-                    style: 'currency', 
-                    currency: 'IDR', 
-                    minimumFractionDigits: 0 
+                formatted_amount: new Intl.NumberFormat('id-ID', {
+                    style: 'currency',
+                    currency: 'IDR',
+                    minimumFractionDigits: 0
                 }).format(order.total_amount),
-                
+
                 // FIX TANGGAL PESAN (Created At): 
                 // Paksa menggunakan timezone Asia/Jakarta agar tidak selisih 7 jam dengan UTC
                 date_label: moment(order.created_at).tz('Asia/Jakarta').format('DD MMM YYYY, HH:mm'),
-                
+
                 // FIX TANGGAL JADWAL (Schedule Date):
                 // Mengonversi tipe data DATE database menjadi string yang cantik
                 formatted_schedule: moment(order.schedule_date).format('DD MMM YYYY'),
-                
+
                 // PARSING JASA TAMBAHAN (JSON parsing):
                 // Karena di DB tipenya LongText/String, kita ubah kembali jadi Array agar frontend bisa looping
                 extra_services_list: order.extra_services ? JSON.parse(order.extra_services) : [],
-                
+
                 // Tambahan: Informasi kadaluarsa dalam format yang bisa dibaca manusia
                 formatted_expiration: expiration ? moment(expiration, "YYYYMMDDHHmmss").format('DD MMM, HH:mm') : '-'
             };
@@ -630,9 +672,9 @@ app.get('/transaction-history', async (req, res) => {
 
     } catch (err) {
         console.error("❌ Error fetch history:", err.message);
-        res.status(500).json({ 
-            error: "Gagal mengambil data riwayat", 
-            message: err.message 
+        res.status(500).json({
+            error: "Gagal mengambil data riwayat",
+            message: err.message
         });
     }
 });
