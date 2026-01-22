@@ -130,23 +130,7 @@ function formatToWhatsAppNumber(localNumber) {
     return `+${cleanNumber}`;
 }
 
-async function sendWhatsAppWithTemplate(to, variables) {
-    const formattedTo = formatToWhatsAppNumber(to);
-    try {
-        const response = await twilioClient.messages.create({
-            from: twilioFrom,
-            to: `whatsapp:${formattedTo}`,
-            contentSid: 'HX83d2f6ce8fa5693a942935bb0f44a77d',
-            // Twilio Node Helper membutuhkan object murni
-            contentVariables: variables 
-        });
-        console.log(`✅ WA Sukses terkirim ke ${formattedTo}. SID: ${response.sid}`);
-        return { status: true, sid: response.sid };
-    } catch (error) {
-        console.error(`❌ Gagal kirim WA ke ${formattedTo}:`, error.message);
-        return { status: false };
-    }
-}
+
 
 async function insertOrderService(body, partnerReff) {
     const now = new Date();
@@ -354,46 +338,41 @@ app.post('/callback', async (req, res) => {
     console.log("-----------------------------------------");
     console.log("🔔 [CALLBACK RECEIVED] Data:", JSON.stringify(req.body));
 
-    // LinkQu mengirim ID unik di partner_reff atau qris_id
+    // 1. Identifikasi ID Referensi dari LinkQu
     const reffFromCallback = req.body.partner_reff || req.body.qris_id;
 
     try {
-        // 1. Ambil data pesanan dari tabel order_service
+        // 2. Ambil data pesanan dari database
+        // Hanya proses jika status masih PENDING untuk mencegah pengiriman notifikasi ganda
         const [orders] = await db.execute(
-            'SELECT * FROM order_service WHERE order_reff = ?', 
+            "SELECT * FROM order_service WHERE order_reff = ? AND order_status = 'PENDING'", 
             [reffFromCallback]
         );
         
+        if (orders.length === 0) {
+            console.warn(`ℹ️ Order #${reffFromCallback} sudah PAID atau tidak ditemukan.`);
+            return res.status(200).send("Done or Not Found");
+        }
+
         const orderData = orders[0];
 
-        if (!orderData) {
-            console.warn(`⚠️ Order #${reffFromCallback} tidak ditemukan di database.`);
-            return res.status(404).json({ error: "Order Not Found" });
-        }
-
-        // 2. Cek status (Cegah pengiriman notifikasi berulang jika LinkQu kirim callback 2x)
-        if (orderData.order_status === 'PAID') {
-            console.log(`ℹ️ Order #${reffFromCallback} sudah LUNAS. Melewati pengiriman notifikasi.`);
-            return res.json({ message: "Already Processed" });
-        }
-
-        // 3. Update Status di Database (Tabel Log & Tabel Utama)
+        // 3. Update Status Pembayaran di Database
         const methodType = req.body.va_code === 'QRIS' ? 'QRIS' : 'VA';
         const logTable = methodType === 'QRIS' ? 'inquiry_qris' : 'inquiry_va';
 
-        // Update Tabel Log Pembayaran
+        // Update Tabel Log (inquiry_va / inquiry_qris)
         await db.execute(
             `UPDATE ${logTable} SET status = 'SUKSES', callback_raw = ?, updated_at = NOW() WHERE partner_reff = ?`,
             [JSON.stringify(req.body), reffFromCallback]
         );
 
-        // Update Tabel Utama order_service
+        // Update Tabel Utama (order_service)
         await db.execute(
             `UPDATE order_service SET order_status = 'PAID', updated_at = NOW() WHERE order_reff = ?`,
             [reffFromCallback]
         );
 
-        // 4. Olah Jasa Tambahan (Parsing LongText JSON)
+        // 4. Olah Jasa Tambahan & Formatting
         let detailJasa = "-";
         if (orderData.extra_services) {
             try {
@@ -402,29 +381,45 @@ app.post('/callback', async (req, res) => {
             } catch (e) { detailJasa = "-"; }
         }
 
-        // Format Rupiah (Jika fungsi formatIDR Anda sudah ada)
-        const totalFormatted = new Intl.NumberFormat('id-ID', { style: 'currency', currency: 'IDR', minimumFractionDigits: 0 }).format(orderData.total_amount);
+        const totalFormatted = `Rp${parseInt(orderData.total_amount).toLocaleString('id-ID')}`;
+        const tglJadwal = moment(orderData.schedule_date).format('DD MMM YYYY');
 
-        // 5. Siapkan Variabel WhatsApp (Sesuai Placeholder {{1}} - {{7}} di Twilio)
+        // 5. Siapkan Object Variabel untuk WhatsApp (Urutan 1-7 sesuai template Twilio)
         const waVariables = {
             "1": String(orderData.customer_name),
             "2": String(orderData.order_reff),
             "3": String(orderData.service_name),
             "4": String(detailJasa),
-            "5": String(moment(orderData.schedule_date).format('DD MMM YYYY')), // Format: 25 Jan 2026
+            "5": String(tglJadwal),
             "6": String(orderData.schedule_time),
             "7": String(totalFormatted)
         };
 
-        console.log("🚀 Dispatching Notifications...");
+        console.log("🚀 Dispatching All Notifications...");
 
-        // --- KIRIM WA PELANGGAN ---
-        await sendWhatsAppWithTemplate(orderData.customer_phone, waVariables);
+        // --- KIRIM WHATSAPP KE PELANGGAN ---
+        try {
+            await twilioClient.messages.create({
+                from: twilioFrom, // Pastikan format e.g: 'whatsapp:+1415...'
+                to: `whatsapp:${formatToWhatsAppNumber(orderData.customer_phone)}`,
+                contentSid: 'HX83d2f6ce8fa5693a942935bb0f44a77d',
+                contentVariables: waVariables // Kirim Object Murni
+            });
+            console.log(`✅ WA Pelanggan Terkirim: ${reffFromCallback}`);
+        } catch (e) { console.error(`❌ WA Pelanggan Error: ${e.message}`); }
 
-        // --- KIRIM WA ADMIN (Gunakan nomor admin yang terdaftar) ---
-        await sendWhatsAppWithTemplate(ADMIN_PHONE, waVariables);
+        // --- KIRIM WHATSAPP KE ADMIN ---
+        try {
+            await twilioClient.messages.create({
+                from: twilioFrom,
+                to: `whatsapp:${formatToWhatsAppNumber(ADMIN_PHONE)}`,
+                contentSid: 'HX83d2f6ce8fa5693a942935bb0f44a77d',
+                contentVariables: waVariables
+            });
+            console.log(`✅ WA Admin Terkirim: ${reffFromCallback}`);
+        } catch (e) { console.error(`❌ WA Admin Error: ${e.message}`); }
 
-        // --- NOTIFIKASI JAGEL (Full Detail) ---
+        // --- NOTIFIKASI APLIKASI JAGEL ---
         try {
             await axios.post('https://api.jagel.id/v1/message/send', {
                 apikey: "z4PBduE9ocedWaaTUCKHnOl7C8yokkTB4catk7FMt5U2d4Lmyv",
@@ -432,24 +427,22 @@ app.post('/callback', async (req, res) => {
                 value: orderData.customer_email || ADMIN_EMAIL,
                 content: `✅ PEMBAYARAN BERHASIL!\n\n` +
                          `Halo ${orderData.customer_name},\n` +
-                         `Pembayaran Ref: ${orderData.order_reff} LUNAS.\n\n` +
-                         `Rincian:\n` +
+                         `Pembayaran Ref: ${orderData.order_reff} telah lunas.\n\n` +
+                         `*Rincian:*\n` +
                          `- Layanan: ${orderData.service_name}\n` +
                          `- Tambahan: ${detailJasa}\n` +
-                         `- Jadwal: ${moment(orderData.schedule_date).format('DD MMM YYYY')} | ${orderData.schedule_time}\n` +
+                         `- Jadwal: ${tglJadwal} | ${orderData.schedule_time} WIB\n` +
                          `- Total: ${totalFormatted}\n\n` +
-                         `Petugas kami akan segera datang sesuai jadwal.`
+                         `Petugas kami akan segera menghubungi Anda.`
             });
         } catch (e) { console.error("❌ Jagel Notif Gagal:", e.message); }
 
-        // --- KIRIM EMAIL KWITANSI (Optional) ---
-        // await sendEmailNotification(orderData.customer_email, `LUNAS #${reffFromCallback}`, "...");
-
-        res.json({ status: "SUCCESS" });
+        // --- KONFIRMASI BALIK KE LINKQU ---
+        res.status(200).send("OK");
 
     } catch (err) {
-        console.error("❌ CALLBACK ERROR:", err.message);
-        res.status(500).send("Internal Server Error");
+        console.error("❌ CALLBACK FATAL ERROR:", err.message);
+        res.status(500).send("Internal Error");
     }
 });
 
