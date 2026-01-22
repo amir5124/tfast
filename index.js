@@ -209,7 +209,7 @@ app.post('/create-va', async (req, res) => {
         const response = await axios.post('https://api.linkqu.id/linkqu-partner/transaction/create/va', {
             amount: body.totalBayar, bank_code: body.metodePembayaran.code, partner_reff,
             username, pin, expired, signature, customer_id: body.kontak.nama,
-            customer_name: body.kontak.nama, customer_email: body.kontak.email, url_callback: "https://layanan.linku.co.id/callback"
+            customer_name: body.kontak.nama, customer_email: body.kontak.email, url_callback: "https://layanan.tangerangfast.online/callback"
         }, { headers: { 'client-id': clientId, 'client-secret': clientSecret } });
 
         const result = response.data;
@@ -244,7 +244,7 @@ app.post('/create-qris', async (req, res) => {
         const response = await axios.post('https://api.linkqu.id/linkqu-partner/transaction/create/qris', {
             amount: body.totalBayar, partner_reff, username, pin, expired, signature,
             customer_id: body.kontak.nama, customer_name: body.kontak.nama, 
-            customer_email: body.kontak.email, url_callback: "https://layanan.linku.co.id/callback"
+            customer_email: body.kontak.email, url_callback: "https://layanan.tangerangfast.online/callback"
         }, { headers: { 'client-id': clientId, 'client-secret': clientSecret } });
 
         const result = response.data;
