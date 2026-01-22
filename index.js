@@ -188,11 +188,6 @@ async function getCurrentStatusQris(partnerReff) {
     return rows.length > 0 ? rows[0].status : null;
 }
 
-// ------------------------------------
-// ⚡ ENDPOINTS
-// ------------------------------------
-
-// --- ENDPOINT CREATE VA ---
 app.post('/create-va', async (req, res) => {
     console.log("-----------------------------------------");
     console.log("🚀 [REQUEST] /create-va", JSON.stringify(req.body));
@@ -202,20 +197,14 @@ app.post('/create-va', async (req, res) => {
         const partner_reff = generatePartnerReff();
         const expired = getExpiredTimestamp();
         
-        console.log(`📝 Generated Reff: ${partner_reff}, Expired: ${expired}`);
-        
         const orderServiceId = await insertOrderService(body, partner_reff);
-        const orderData = await getOrderDetails(partner_reff);
-
+        
         const signature = generateSignaturePOST({
             amount: body.totalBayar, expired, bank_code: body.metodePembayaran.code, 
             partner_reff, customer_id: body.kontak.nama, customer_name: body.kontak.nama, 
             customer_email: body.kontak.email, clientId
         }, '/transaction/create/va');
 
-        console.log(`🔐 Generated Signature: ${signature}`);
-
-        console.log("📡 Sending Request to LinkQu API...");
         const response = await axios.post('https://api.linkqu.id/linkqu-partner/transaction/create/va', {
             amount: body.totalBayar, bank_code: body.metodePembayaran.code, partner_reff,
             username, pin, expired, signature, customer_id: body.kontak.nama,
@@ -224,7 +213,6 @@ app.post('/create-va', async (req, res) => {
         }, { headers: { 'client-id': clientId, 'client-secret': clientSecret } });
 
         const result = response.data;
-        console.log("✅ [LINKQU RES]", JSON.stringify(result));
 
         await db.query('INSERT INTO inquiry_va SET ?', [{
             order_service_id: orderServiceId, partner_reff, customer_id: body.kontak.nama,
@@ -233,40 +221,56 @@ app.post('/create-va', async (req, res) => {
             created_at: new Date(), status: "PENDING"
         }]);
 
-        // Email Invoice
-        console.log(`📧 Sending Email Invoice to: ${body.kontak.email}`);
-        const emailHTML = `<html><body><h2>TAGIHAN #${partner_reff}</h2><p>Layanan: ${body.layanan.nama}</p><p>Total: ${formatIDR(body.totalBayar)}</p><p>VA: ${result?.virtual_account}</p></body></html>`;
-        await sendEmailNotification(body.kontak.email, `Tagihan #${partner_reff}`, emailHTML);
+        // --- TEMPLATE EMAIL PROFESIONAL VA ---
+        const detailJasa = body.jasaTambahan.length > 0 ? body.jasaTambahan.map(j => j.nama).join(', ') : '-';
+        const emailHTML = `
+        <div style="font-family: sans-serif; color: #333; max-width: 600px; margin: auto; border: 1px solid #eee; padding: 20px; border-radius: 15px;">
+            <div style="text-align: center; margin-bottom: 20px;">
+                <h2 style="color: #0194f3; margin: 0;">INVOICE PEMBAYARAN</h2>
+                <p style="font-size: 12px; color: #999;">ID Transaksi: ${partner_reff}</p>
+            </div>
+            <p>Halo <b>${body.kontak.nama}</b>,</p>
+            <p>Pesanan Anda telah diterima. Silakan lakukan pembayaran melalui <b>Virtual Account</b> berikut:</p>
+            
+            <div style="background: #f0f9ff; border: 1px dashed #0194f3; padding: 15px; text-align: center; border-radius: 10px; margin: 20px 0;">
+                <span style="font-size: 14px; color: #666;">Nomor Virtual Account (${result?.bank_name || body.metodePembayaran.name})</span><br>
+                <b style="font-size: 24px; color: #0194f3;">${result?.virtual_account}</b>
+            </div>
+
+            <table style="width: 100%; border-collapse: collapse; margin-bottom: 20px;">
+                <tr style="border-bottom: 1px solid #eee;"><td style="padding: 10px 0;">Layanan</td><td style="text-align: right; font-weight: bold;">${body.layanan.nama}</td></tr>
+                <tr style="border-bottom: 1px solid #eee;"><td style="padding: 10px 0;">Jadwal</td><td style="text-align: right; font-weight: bold;">${body.jadwal.tanggal} | ${body.jadwal.jam}</td></tr>
+                <tr style="border-bottom: 1px solid #eee;"><td style="padding: 10px 0;">Tambahan</td><td style="text-align: right;">${detailJasa}</td></tr>
+                <tr style="border-bottom: 1px solid #eee;"><td style="padding: 10px 0;">Alamat</td><td style="text-align: right; font-size: 12px;">${body.alamat}, ${body.lokasi}</td></tr>
+                <tr><td style="padding: 15px 0; font-size: 18px;"><b>Total Bayar</b></td><td style="text-align: right; font-size: 18px; color: #0194f3;"><b>${formatIDR(body.totalBayar)}</b></td></tr>
+            </table>
+
+            <p style="font-size: 12px; color: #ef4444; text-align: center; background: #fef2f2; padding: 10px; border-radius: 5px;">
+                ⚠ Mohon selesaikan pembayaran sebelum batas waktu yang ditentukan.
+            </p>
+        </div>`;
+
+        await sendEmailNotification(body.kontak.email, `Instruksi Pembayaran #${partner_reff}`, emailHTML);
         
-        console.log("🏁 Process /create-va Done.");
         res.json(result);
     } catch (err) { 
-        console.error("❌ [ERROR] /create-va:", err.message);
         res.status(500).json({ error: err.message }); 
     }
 });
 
-// --- ENDPOINT CREATE QRIS ---
 app.post('/create-qris', async (req, res) => {
-    console.log("-----------------------------------------");
-    console.log("🚀 [REQUEST] /create-qris", JSON.stringify(req.body));
-
     try {
         const body = req.body;
         const partner_reff = generatePartnerReff();
         const expired = getExpiredTimestamp();
         
-        console.log(`📝 Generated Reff: ${partner_reff}`);
-
         const orderServiceId = await insertOrderService(body, partner_reff);
-        const orderData = await getOrderDetails(partner_reff);
 
         const signature = generateSignaturePOST({
             amount: body.totalBayar, expired, partner_reff, customer_id: body.kontak.nama,
             customer_name: body.kontak.nama, customer_email: body.kontak.email, clientId
         }, '/transaction/create/qris');
 
-        console.log("📡 Sending Request to LinkQu API (QRIS)...");
         const response = await axios.post('https://api.linkqu.id/linkqu-partner/transaction/create/qris', {
             amount: body.totalBayar, partner_reff, username, pin, expired, signature,
             customer_id: body.kontak.nama, customer_name: body.kontak.nama, 
@@ -274,19 +278,44 @@ app.post('/create-qris', async (req, res) => {
         }, { headers: { 'client-id': clientId, 'client-secret': clientSecret } });
 
         const result = response.data;
-        console.log("✅ [LINKQU RES]", JSON.stringify(result));
 
         await db.execute(`INSERT INTO inquiry_qris (order_service_id, partner_reff, customer_id, amount, expired, qris_url, response_raw, created_at, status) VALUES (?, ?, ?, ?, ?, ?, ?, NOW(), 'PENDING')`,
             [orderServiceId, partner_reff, body.kontak.nama, body.totalBayar, expired, result?.imageqris, JSON.stringify(result)]);
 
-        console.log(`📧 Sending Email QRIS to: ${body.kontak.email}`);
-        const emailHTML = `<html><body><h2>TAGIHAN #${partner_reff}</h2><p>Total: ${formatIDR(body.totalBayar)}</p><p>Scan QRIS: <a href="${result?.imageqris}">Klik Di Sini</a></p></body></html>`;
-        await sendEmailNotification(body.kontak.email, `Tagihan #${partner_reff}`, emailHTML);
+        // --- TEMPLATE EMAIL PROFESIONAL QRIS ---
+        const detailJasa = body.jasaTambahan.length > 0 ? body.jasaTambahan.map(j => j.nama).join(', ') : '-';
+        const emailHTML = `
+        <div style="font-family: sans-serif; color: #333; max-width: 600px; margin: auto; border: 1px solid #eee; padding: 20px; border-radius: 15px;">
+            <div style="text-align: center; margin-bottom: 20px;">
+                <h2 style="color: #22c55e; margin: 0;">INVOICE PEMBAYARAN QRIS</h2>
+                <p style="font-size: 12px; color: #999;">ID Transaksi: ${partner_reff}</p>
+            </div>
+            
+            <p>Halo <b>${body.kontak.nama}</b>,</p>
+            <p>Silakan lakukan pembayaran dengan melakukan scan pada kode QRIS di bawah ini:</p>
+            
+            <div style="text-align: center; margin: 25px 0; padding: 20px; background: #f9fafb; border-radius: 10px;">
+                <img src="${result?.imageqris}" alt="QRIS Code" style="width: 250px; height: 250px; border: 5px solid #fff; box-shadow: 0 4px 6px -1px rgb(0 0 0 / 0.1);">
+                <p style="margin-top: 10px; font-weight: bold; color: #374151;">Scan menggunakan aplikasi bank atau e-wallet Anda</p>
+            </div>
 
-        console.log("🏁 Process /create-qris Done.");
+            <table style="width: 100%; border-collapse: collapse; margin-bottom: 20px;">
+                <tr style="border-bottom: 1px solid #eee;"><td style="padding: 10px 0; color: #666;">Layanan</td><td style="text-align: right; font-weight: bold;">${body.layanan.nama}</td></tr>
+                <tr style="border-bottom: 1px solid #eee;"><td style="padding: 10px 0; color: #666;">Jadwal Kerja</td><td style="text-align: right; font-weight: bold;">${body.jadwal.tanggal} | ${body.jadwal.jam}</td></tr>
+                <tr style="border-bottom: 1px solid #eee;"><td style="padding: 10px 0; color: #666;">Tambahan Jasa</td><td style="text-align: right;">${detailJasa}</td></tr>
+                <tr style="border-bottom: 1px solid #eee;"><td style="padding: 10px 0; color: #666;">Lokasi Kerja</td><td style="text-align: right; font-size: 12px;">${body.alamat}, ${body.lokasi}</td></tr>
+                <tr><td style="padding: 15px 0; font-size: 18px;"><b>Total Bayar</b></td><td style="text-align: right; font-size: 18px; color: #22c55e;"><b>${formatIDR(body.totalBayar)}</b></td></tr>
+            </table>
+
+            <div style="background: #f8fafc; padding: 15px; border-radius: 8px; font-size: 12px; color: #475569;">
+                <b>Catatan:</b> ${body.catatan || 'Tidak ada catatan tambahan.'}
+            </div>
+        </div>`;
+
+        await sendEmailNotification(body.kontak.email, `Tagihan Pembayaran QRIS #${partner_reff}`, emailHTML);
+
         res.json(result);
     } catch (err) { 
-        console.error("❌ [ERROR] /create-qris:", err.message);
         res.status(500).json({ error: err.message }); 
     }
 });
@@ -477,15 +506,43 @@ app.get('/qr-list', async (req, res) => {
 app.get('/transaction-history', async (req, res) => {
     const { email } = req.query;
     if (!email) return res.status(400).json({ error: "Email is required" });
+
     try {
         const [orders] = await db.query(`
-            SELECT os.order_reff, os.service_name, os.total_amount, os.order_status, os.created_at, os.payment_method,
-            va.va_number, va.bank_name, qr.qris_url FROM order_service os
+            SELECT 
+                os.order_reff, os.service_name, os.total_amount, os.order_status, os.created_at, os.payment_method,
+                va.va_number, va.bank_name, va.expired as va_expired,
+                qr.qris_url, qr.expired as qr_expired
+            FROM order_service os
             LEFT JOIN inquiry_va va ON os.order_reff = va.partner_reff
             LEFT JOIN inquiry_qris qr ON os.order_reff = qr.partner_reff
-            WHERE os.customer_email = ? ORDER BY os.created_at DESC`, [email]);
-        res.json(orders);
-    } catch (err) { res.status(500).json({ error: err.message }); }
+            WHERE os.customer_email = ?
+            ORDER BY os.created_at DESC
+        `, [email]);
+
+        const now = moment().tz('Asia/Jakarta').format('YYYYMMDDHHmmss');
+
+        const history = orders.map(order => {
+            let status = order.order_status;
+            const expiration = order.va_expired || order.qr_expired;
+
+            // Logika Status Gagal jika Expired
+            if (status === 'PENDING_PAYMENT' && expiration && now > expiration) {
+                status = 'EXPIRED';
+            }
+
+            return {
+                ...order,
+                order_status: status,
+                formatted_amount: formatIDR(order.total_amount),
+                date_label: moment(order.created_at).format('DD MMM YYYY, HH:mm')
+            };
+        });
+
+        res.json(history);
+    } catch (err) {
+        res.status(500).json({ error: err.message });
+    }
 });
 
 const PORT = 3000;
