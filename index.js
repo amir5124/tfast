@@ -146,24 +146,7 @@ async function sendWhatsAppCustomerSuccess(to, variables) {
     }
 }
 
-async function sendWhatsAppAdminNotification(to, messageBody) {
-    const formattedTo = formatToWhatsAppNumber(to);
-    try {
-        await twilioClient.messages.create({
-            from: twilioFrom,
-            to: `whatsapp:${formattedTo}`,
-            body: messageBody,
-        });
-        return { status: true };
-    } catch (error) {
-        logToFile(`❌ Gagal WA Admin: ${error.message}`);
-        return { status: false };
-    }
-}
 
-// ------------------------------------
-// 🔄 DATABASE HELPERS
-// ------------------------------------
 
 async function insertOrderService(body, partnerReff) {
     const now = new Date();
@@ -277,67 +260,76 @@ app.post('/create-qris', async (req, res) => {
 
 app.post('/callback', async (req, res) => {
     const { partner_reff, va_code } = req.body;
+    
     try {
-        const methodType = va_code === 'QRIS' ? 'QRIS' : 'VA';
-        const currentStatus = methodType === 'QRIS' ? await getCurrentStatusQris(partner_reff) : await getCurrentStatusVa(partner_reff);
-
-        if (currentStatus === 'SUKSES') return res.json({ message: "Done" });
-
+        // 1. Ambil data order dari database
         const orderData = await getOrderDetails(partner_reff);
         if (!orderData) return res.status(404).json({ error: "Order Not Found" });
 
-        const table = methodType === 'QRIS' ? 'inquiry_qris' : 'inquiry_va';
-        await db.execute(`UPDATE ${table} SET status = 'SUKSES', callback_raw = ?, updated_at = NOW() WHERE partner_reff = ?`, [JSON.stringify(req.body), partner_reff]);
-        await db.execute(`UPDATE order_service SET order_status = 'PAID', email_status = 'PAID', updated_at = NOW() WHERE order_reff = ?`, [partner_reff]);
+        // Cegah proses ganda jika sudah lunas
+        if (orderData.order_status === 'PAID') return res.json({ message: "Done" });
 
-        // 1. Detail Jasa Tambahan untuk Pesan
-        let detailJasa = "Tidak ada";
+        const methodType = va_code === 'QRIS' ? 'QRIS' : 'VA';
+        const table = methodType === 'QRIS' ? 'inquiry_qris' : 'inquiry_va';
+
+        // 2. Update Database (Lunas)
+        await db.execute(
+            `UPDATE ${table} SET status = 'SUKSES', callback_raw = ?, updated_at = NOW() WHERE partner_reff = ?`, 
+            [JSON.stringify(req.body), partner_reff]
+        );
+        await db.execute(
+            `UPDATE order_service SET order_status = 'PAID', updated_at = NOW() WHERE order_reff = ?`, 
+            [partner_reff]
+        );
+
+        // 3. Siapkan Variabel Notifikasi
+        const totalFormatted = formatIDR(orderData.total_amount);
+        let detailJasa = "-";
         if (orderData.extra_services) {
             try {
                 const extras = JSON.parse(orderData.extra_services);
-                detailJasa = extras.map(item => item.nama).join(', ');
-            } catch (e) { 
-                detailJasa = "-"; 
-            }
+                detailJasa = extras.map(i => i.nama).join(', ');
+            } catch (e) { detailJasa = "-"; }
         }
 
-        // 2. Siapkan Variabel WhatsApp Customer (7 Variabel sesuai Template Twilio)
-        const waVariables = {
-            1: String(orderData.customer_name || "Pelanggan"),
-            2: String(orderData.order_reff || "-"),
-            3: String(orderData.service_name || "-"),
-            4: String(detailJasa),
-            5: String(orderData.schedule_date || "-"),
-            6: String(orderData.schedule_time || "-"),
-            7: String(formatIDR(orderData.total_amount))
-        };
+        // 4. KIRIM NOTIFIKASI JAGEL (Paling Stabil)
+        try {
+            await axios.post('https://api.jagel.id/v1/message/send', {
+                apikey: "z4PBduE9ocedWaaTUCKHnOl7C8yokkTB4catk7FMt5U2d4Lmyv", 
+                type: 'email', 
+                value: orderData.customer_email || ADMIN_EMAIL,
+                content: `✅ *PEMBAYARAN BERHASIL!*\n\nInv: *${partner_reff}*\nLayanan: ${orderData.service_name}\nTotal: ${totalFormatted}`
+            });
+        } catch (e) { logToFile(`Jagel Error: ${e.message}`); }
 
-        // 3. Kirim WhatsApp ke Customer
-        await sendWhatsAppCustomerSuccess(orderData.customer_phone, waVariables);
+        // 5. KIRIM WA CUSTOMER (Twilio)
+        await sendWhatsAppCustomerSuccess(orderData.customer_phone, {
+            1: orderData.customer_name,
+            2: partner_reff,
+            3: orderData.service_name,
+            4: detailJasa,
+            5: orderData.schedule_date,
+            6: orderData.schedule_time,
+            7: totalFormatted
+        });
 
-        // 4. Kirim WhatsApp ke Admin (Notifikasi Internal)
-        const adminMsg = `✅ *PEMBAYARAN MASUK*\n\n` +
-                         `Inv: *${orderData.order_reff}*\n` +
-                         `Cust: ${orderData.customer_name}\n` +
-                         `Layanan: ${orderData.service_name}\n` +
-                         `Tambahan: ${detailJasa}\n` +
-                         `Jadwal: ${orderData.schedule_date} ${orderData.schedule_time}\n` +
-                         `Total: ${formatIDR(orderData.total_amount)}`;
-        
-        await sendWhatsAppAdminNotification(ADMIN_PHONE, adminMsg);
-
-        // 5. Kirim Email Konfirmasi ke Customer
-        await sendEmailNotification(
-            orderData.customer_email, 
-            `Pembayaran Berhasil #${partner_reff}`, 
-            `<h2>Terima Kasih!</h2><p>Pesanan ${partner_reff} telah dibayar dan sedang kami proses.</p>`
-        );
+        // 6. KIRIM EMAIL DETAIL
+        const emailHtml = `
+            <div style="font-family:sans-serif; padding:20px; border:1px solid #ddd; border-radius:10px;">
+                <h2 style="color:#27ae60;">Pembayaran Diterima!</h2>
+                <p>Pesanan <b>#${partner_reff}</b> telah lunas.</p>
+                <hr>
+                <p><b>Detail Layanan:</b> ${orderData.service_name}</p>
+                <p><b>Jadwal:</b> ${orderData.schedule_date} ${orderData.schedule_time}</p>
+                <p><b>Total:</b> ${totalFormatted}</p>
+            </div>`;
+        await sendEmailNotification(orderData.customer_email, `Lunas #${partner_reff}`, emailHtml);
 
         res.json({ message: "OK" });
 
     } catch (err) {
         logToFile(`❌ Callback Error: ${err.message}`);
-        res.status(500).send(err.message);
+        res.status(500).send("Internal Server Error");
     }
 });
 
