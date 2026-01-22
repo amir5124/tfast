@@ -192,11 +192,18 @@ async function getCurrentStatusQris(partnerReff) {
 // ⚡ ENDPOINTS
 // ------------------------------------
 
+// --- ENDPOINT CREATE VA ---
 app.post('/create-va', async (req, res) => {
+    console.log("-----------------------------------------");
+    console.log("🚀 [REQUEST] /create-va", JSON.stringify(req.body));
+    
     try {
         const body = req.body;
         const partner_reff = generatePartnerReff();
         const expired = getExpiredTimestamp();
+        
+        console.log(`📝 Generated Reff: ${partner_reff}, Expired: ${expired}`);
+        
         const orderServiceId = await insertOrderService(body, partner_reff);
         const orderData = await getOrderDetails(partner_reff);
 
@@ -206,13 +213,19 @@ app.post('/create-va', async (req, res) => {
             customer_email: body.kontak.email, clientId
         }, '/transaction/create/va');
 
+        console.log(`🔐 Generated Signature: ${signature}`);
+
+        console.log("📡 Sending Request to LinkQu API...");
         const response = await axios.post('https://api.linkqu.id/linkqu-partner/transaction/create/va', {
             amount: body.totalBayar, bank_code: body.metodePembayaran.code, partner_reff,
             username, pin, expired, signature, customer_id: body.kontak.nama,
-            customer_name: body.kontak.nama, customer_email: body.kontak.email, url_callback: "https://layanan.tangerangfast.online/callback"
+            customer_name: body.kontak.nama, customer_email: body.kontak.email, 
+            url_callback: "https://layanan.tangerangfast.online/callback"
         }, { headers: { 'client-id': clientId, 'client-secret': clientSecret } });
 
         const result = response.data;
+        console.log("✅ [LINKQU RES]", JSON.stringify(result));
+
         await db.query('INSERT INTO inquiry_va SET ?', [{
             order_service_id: orderServiceId, partner_reff, customer_id: body.kontak.nama,
             amount: body.totalBayar, bank_name: result?.bank_name || body.metodePembayaran.name,
@@ -221,18 +234,30 @@ app.post('/create-va', async (req, res) => {
         }]);
 
         // Email Invoice
+        console.log(`📧 Sending Email Invoice to: ${body.kontak.email}`);
         const emailHTML = `<html><body><h2>TAGIHAN #${partner_reff}</h2><p>Layanan: ${body.layanan.nama}</p><p>Total: ${formatIDR(body.totalBayar)}</p><p>VA: ${result?.virtual_account}</p></body></html>`;
         await sendEmailNotification(body.kontak.email, `Tagihan #${partner_reff}`, emailHTML);
         
+        console.log("🏁 Process /create-va Done.");
         res.json(result);
-    } catch (err) { res.status(500).json({ error: err.message }); }
+    } catch (err) { 
+        console.error("❌ [ERROR] /create-va:", err.message);
+        res.status(500).json({ error: err.message }); 
+    }
 });
 
+// --- ENDPOINT CREATE QRIS ---
 app.post('/create-qris', async (req, res) => {
+    console.log("-----------------------------------------");
+    console.log("🚀 [REQUEST] /create-qris", JSON.stringify(req.body));
+
     try {
         const body = req.body;
         const partner_reff = generatePartnerReff();
         const expired = getExpiredTimestamp();
+        
+        console.log(`📝 Generated Reff: ${partner_reff}`);
+
         const orderServiceId = await insertOrderService(body, partner_reff);
         const orderData = await getOrderDetails(partner_reff);
 
@@ -241,6 +266,7 @@ app.post('/create-qris', async (req, res) => {
             customer_name: body.kontak.nama, customer_email: body.kontak.email, clientId
         }, '/transaction/create/qris');
 
+        console.log("📡 Sending Request to LinkQu API (QRIS)...");
         const response = await axios.post('https://api.linkqu.id/linkqu-partner/transaction/create/qris', {
             amount: body.totalBayar, partner_reff, username, pin, expired, signature,
             customer_id: body.kontak.nama, customer_name: body.kontak.nama, 
@@ -248,31 +274,46 @@ app.post('/create-qris', async (req, res) => {
         }, { headers: { 'client-id': clientId, 'client-secret': clientSecret } });
 
         const result = response.data;
+        console.log("✅ [LINKQU RES]", JSON.stringify(result));
+
         await db.execute(`INSERT INTO inquiry_qris (order_service_id, partner_reff, customer_id, amount, expired, qris_url, response_raw, created_at, status) VALUES (?, ?, ?, ?, ?, ?, ?, NOW(), 'PENDING')`,
             [orderServiceId, partner_reff, body.kontak.nama, body.totalBayar, expired, result?.imageqris, JSON.stringify(result)]);
 
+        console.log(`📧 Sending Email QRIS to: ${body.kontak.email}`);
         const emailHTML = `<html><body><h2>TAGIHAN #${partner_reff}</h2><p>Total: ${formatIDR(body.totalBayar)}</p><p>Scan QRIS: <a href="${result?.imageqris}">Klik Di Sini</a></p></body></html>`;
         await sendEmailNotification(body.kontak.email, `Tagihan #${partner_reff}`, emailHTML);
 
+        console.log("🏁 Process /create-qris Done.");
         res.json(result);
-    } catch (err) { res.status(500).json({ error: err.message }); }
+    } catch (err) { 
+        console.error("❌ [ERROR] /create-qris:", err.message);
+        res.status(500).json({ error: err.message }); 
+    }
 });
 
+// --- ENDPOINT CALLBACK ---
 app.post('/callback', async (req, res) => {
+    console.log("-----------------------------------------");
+    console.log("🔔 [CALLBACK RECEIVED] Data:", JSON.stringify(req.body));
+    
     const { partner_reff, va_code } = req.body;
     
     try {
-        // 1. Ambil data order dari database
         const orderData = await getOrderDetails(partner_reff);
-        if (!orderData) return res.status(404).json({ error: "Order Not Found" });
+        if (!orderData) {
+            console.warn(`⚠️ Order #${partner_reff} not found in database.`);
+            return res.status(404).json({ error: "Order Not Found" });
+        }
 
-        // Cegah proses ganda jika sudah lunas
-        if (orderData.order_status === 'PAID') return res.json({ message: "Done" });
+        if (orderData.order_status === 'PAID') {
+            console.log(`ℹ️ Order #${partner_reff} already marked as PAID. Skipping.`);
+            return res.json({ message: "Done" });
+        }
 
         const methodType = va_code === 'QRIS' ? 'QRIS' : 'VA';
         const table = methodType === 'QRIS' ? 'inquiry_qris' : 'inquiry_va';
 
-        // 2. Update Database (Lunas)
+        console.log(`💾 Updating Database for #${partner_reff} (${methodType})...`);
         await db.execute(
             `UPDATE ${table} SET status = 'SUKSES', callback_raw = ?, updated_at = NOW() WHERE partner_reff = ?`, 
             [JSON.stringify(req.body), partner_reff]
@@ -282,7 +323,6 @@ app.post('/callback', async (req, res) => {
             [partner_reff]
         );
 
-        // 3. Siapkan Variabel Notifikasi
         const totalFormatted = formatIDR(orderData.total_amount);
         let detailJasa = "-";
         if (orderData.extra_services) {
@@ -292,17 +332,21 @@ app.post('/callback', async (req, res) => {
             } catch (e) { detailJasa = "-"; }
         }
 
-        // 4. KIRIM NOTIFIKASI JAGEL (Paling Stabil)
+        console.log("🚀 Dispatching Notifications...");
+
+        // 4. NOTIFIKASI JAGEL
         try {
+            console.log("- Sending Jagel Notif...");
             await axios.post('https://api.jagel.id/v1/message/send', {
                 apikey: "z4PBduE9ocedWaaTUCKHnOl7C8yokkTB4catk7FMt5U2d4Lmyv", 
                 type: 'email', 
                 value: orderData.customer_email || ADMIN_EMAIL,
                 content: `✅ *PEMBAYARAN BERHASIL!*\n\nInv: *${partner_reff}*\nLayanan: ${orderData.service_name}\nTotal: ${totalFormatted}`
             });
-        } catch (e) { logToFile(`Jagel Error: ${e.message}`); }
+        } catch (e) { console.error("❌ Jagel Notif Error:", e.message); }
 
-        // 5. KIRIM WA CUSTOMER (Twilio)
+        // 5. KIRIM WA CUSTOMER
+        console.log("- Sending WhatsApp Customer...");
         await sendWhatsAppCustomerSuccess(orderData.customer_phone, {
             1: orderData.customer_name,
             2: partner_reff,
@@ -314,21 +358,15 @@ app.post('/callback', async (req, res) => {
         });
 
         // 6. KIRIM EMAIL DETAIL
-        const emailHtml = `
-            <div style="font-family:sans-serif; padding:20px; border:1px solid #ddd; border-radius:10px;">
-                <h2 style="color:#27ae60;">Pembayaran Diterima!</h2>
-                <p>Pesanan <b>#${partner_reff}</b> telah lunas.</p>
-                <hr>
-                <p><b>Detail Layanan:</b> ${orderData.service_name}</p>
-                <p><b>Jadwal:</b> ${orderData.schedule_date} ${orderData.schedule_time}</p>
-                <p><b>Total:</b> ${totalFormatted}</p>
-            </div>`;
+        console.log("- Sending Final Confirmation Email...");
+        const emailHtml = `<div style="font-family:sans-serif; padding:20px; border:1px solid #ddd; border-radius:10px;"> ... </div>`;
         await sendEmailNotification(orderData.customer_email, `Lunas #${partner_reff}`, emailHtml);
 
+        console.log(`✅ [CALLBACK SUCCESS] #${partner_reff} processed.`);
         res.json({ message: "OK" });
 
     } catch (err) {
-        logToFile(`❌ Callback Error: ${err.message}`);
+        console.error("❌ [CALLBACK FATAL ERROR]:", err.message);
         res.status(500).send("Internal Server Error");
     }
 });
@@ -439,43 +477,15 @@ app.get('/qr-list', async (req, res) => {
 app.get('/transaction-history', async (req, res) => {
     const { email } = req.query;
     if (!email) return res.status(400).json({ error: "Email is required" });
-
     try {
         const [orders] = await db.query(`
-            SELECT 
-                os.order_reff, os.service_name, os.total_amount, os.order_status, os.created_at, os.payment_method,
-                va.va_number, va.bank_name, va.expired as va_expired,
-                qr.qris_url, qr.expired as qr_expired
-            FROM order_service os
+            SELECT os.order_reff, os.service_name, os.total_amount, os.order_status, os.created_at, os.payment_method,
+            va.va_number, va.bank_name, qr.qris_url FROM order_service os
             LEFT JOIN inquiry_va va ON os.order_reff = va.partner_reff
             LEFT JOIN inquiry_qris qr ON os.order_reff = qr.partner_reff
-            WHERE os.customer_email = ?
-            ORDER BY os.created_at DESC
-        `, [email]);
-
-        const now = moment().tz('Asia/Jakarta').format('YYYYMMDDHHmmss');
-
-        const history = orders.map(order => {
-            let status = order.order_status;
-            const expiration = order.va_expired || order.qr_expired;
-
-            // Logika Status Gagal jika Expired
-            if (status === 'PENDING_PAYMENT' && expiration && now > expiration) {
-                status = 'EXPIRED';
-            }
-
-            return {
-                ...order,
-                order_status: status,
-                formatted_amount: formatIDR(order.total_amount),
-                date_label: moment(order.created_at).format('DD MMM YYYY, HH:mm')
-            };
-        });
-
-        res.json(history);
-    } catch (err) {
-        res.status(500).json({ error: err.message });
-    }
+            WHERE os.customer_email = ? ORDER BY os.created_at DESC`, [email]);
+        res.json(orders);
+    } catch (err) { res.status(500).json({ error: err.message }); }
 });
 
 const PORT = 3000;
