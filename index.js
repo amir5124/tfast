@@ -342,37 +342,41 @@ app.post('/callback', async (req, res) => {
     const reffFromCallback = req.body.partner_reff || req.body.qris_id;
 
     try {
-        // 2. Ambil data pesanan dari database
-        // Hanya proses jika status masih PENDING untuk mencegah pengiriman notifikasi ganda
+        // 2. Ambil data pesanan dari database (Tanpa filter PENDING agar data selalu ada untuk notifikasi)
         const [orders] = await db.execute(
-            "SELECT * FROM order_service WHERE order_reff = ? AND order_status = 'PENDING'", 
+            "SELECT * FROM order_service WHERE order_reff = ?", 
             [reffFromCallback]
         );
         
         if (orders.length === 0) {
-            console.warn(`ℹ️ Order #${reffFromCallback} sudah PAID atau tidak ditemukan.`);
-            return res.status(200).send("Done or Not Found");
+            console.error(`❌ Order #${reffFromCallback} tidak ditemukan di database.`);
+            return res.status(404).send("Order Not Found");
         }
 
         const orderData = orders[0];
 
-        // 3. Update Status Pembayaran di Database
-        const methodType = req.body.va_code === 'QRIS' ? 'QRIS' : 'VA';
-        const logTable = methodType === 'QRIS' ? 'inquiry_qris' : 'inquiry_va';
+        // 3. LOGIKA UPDATE DATABASE (Hanya dijalankan jika status belum PAID)
+        if (orderData.order_status !== 'PAID') {
+            const methodType = req.body.va_code === 'QRIS' ? 'QRIS' : 'VA';
+            const logTable = methodType === 'QRIS' ? 'inquiry_qris' : 'inquiry_va';
 
-        // Update Tabel Log (inquiry_va / inquiry_qris)
-        await db.execute(
-            `UPDATE ${logTable} SET status = 'SUKSES', callback_raw = ?, updated_at = NOW() WHERE partner_reff = ?`,
-            [JSON.stringify(req.body), reffFromCallback]
-        );
+            // Update Tabel Log (inquiry_va / inquiry_qris)
+            await db.execute(
+                `UPDATE ${logTable} SET status = 'SUKSES', callback_raw = ?, updated_at = NOW() WHERE partner_reff = ?`,
+                [JSON.stringify(req.body), reffFromCallback]
+            );
 
-        // Update Tabel Utama (order_service)
-        await db.execute(
-            `UPDATE order_service SET order_status = 'PAID', updated_at = NOW() WHERE order_reff = ?`,
-            [reffFromCallback]
-        );
+            // Update Tabel Utama (order_service)
+            await db.execute(
+                `UPDATE order_service SET order_status = 'PAID', updated_at = NOW() WHERE order_reff = ?`,
+                [reffFromCallback]
+            );
+            console.log(`✅ Database Updated to PAID for #${reffFromCallback}`);
+        } else {
+            console.log(`ℹ️ Order #${reffFromCallback} sudah berstatus PAID di database. Melewati proses update, langsung kirim notifikasi.`);
+        }
 
-        // 4. Olah Jasa Tambahan & Formatting
+        // 4. Olah Jasa Tambahan & Formatting Data
         let detailJasa = "-";
         if (orderData.extra_services) {
             try {
@@ -386,12 +390,12 @@ app.post('/callback', async (req, res) => {
 
         // 5. Siapkan Object Variabel untuk WhatsApp (Urutan 1-7 sesuai template Twilio)
         const waVariables = {
-            "1": String(orderData.customer_name),
-            "2": String(orderData.order_reff),
-            "3": String(orderData.service_name),
-            "4": String(detailJasa),
+            "1": String(orderData.customer_name || "Pelanggan"),
+            "2": String(orderData.order_reff || "-"),
+            "3": String(orderData.service_name || "-"),
+            "4": String(detailJasa || "-"),
             "5": String(tglJadwal),
-            "6": String(orderData.schedule_time),
+            "6": String(orderData.schedule_time || "00:00"),
             "7": String(totalFormatted)
         };
 
@@ -400,12 +404,12 @@ app.post('/callback', async (req, res) => {
         // --- KIRIM WHATSAPP KE PELANGGAN ---
         try {
             await twilioClient.messages.create({
-                from: twilioFrom, // Pastikan format e.g: 'whatsapp:+1415...'
+                from: twilioFrom, 
                 to: `whatsapp:${formatToWhatsAppNumber(orderData.customer_phone)}`,
                 contentSid: 'HX83d2f6ce8fa5693a942935bb0f44a77d',
-                contentVariables: waVariables // Kirim Object Murni
+                contentVariables: waVariables
             });
-            console.log(`✅ WA Pelanggan Terkirim: ${reffFromCallback}`);
+            console.log(`✅ WA Pelanggan Terproses: ${reffFromCallback}`);
         } catch (e) { console.error(`❌ WA Pelanggan Error: ${e.message}`); }
 
         // --- KIRIM WHATSAPP KE ADMIN ---
@@ -416,7 +420,7 @@ app.post('/callback', async (req, res) => {
                 contentSid: 'HX83d2f6ce8fa5693a942935bb0f44a77d',
                 contentVariables: waVariables
             });
-            console.log(`✅ WA Admin Terkirim: ${reffFromCallback}`);
+            console.log(`✅ WA Admin Terproses: ${reffFromCallback}`);
         } catch (e) { console.error(`❌ WA Admin Error: ${e.message}`); }
 
         // --- NOTIFIKASI APLIKASI JAGEL ---
@@ -425,23 +429,24 @@ app.post('/callback', async (req, res) => {
                 apikey: "z4PBduE9ocedWaaTUCKHnOl7C8yokkTB4catk7FMt5U2d4Lmyv",
                 type: 'email',
                 value: orderData.customer_email || ADMIN_EMAIL,
-                content: `✅ PEMBAYARAN BERHASIL!\n\n` +
+                content: `✅ *PEMBAYARAN BERHASIL!*\n\n` +
                          `Halo ${orderData.customer_name},\n` +
                          `Pembayaran Ref: ${orderData.order_reff} telah lunas.\n\n` +
-                         `*Rincian:*\n` +
+                         `Rincian:\n` +
                          `- Layanan: ${orderData.service_name}\n` +
                          `- Tambahan: ${detailJasa}\n` +
                          `- Jadwal: ${tglJadwal} | ${orderData.schedule_time} WIB\n` +
                          `- Total: ${totalFormatted}\n\n` +
                          `Petugas kami akan segera menghubungi Anda.`
             });
+            console.log(`✅ Jagel Notif Terproses.`);
         } catch (e) { console.error("❌ Jagel Notif Gagal:", e.message); }
 
         // --- KONFIRMASI BALIK KE LINKQU ---
         res.status(200).send("OK");
 
     } catch (err) {
-        console.error("❌ CALLBACK FATAL ERROR:", err.message);
+        console.error("❌ CALLBACK FATAL ERROR:", err.stack);
         res.status(500).send("Internal Error");
     }
 });
