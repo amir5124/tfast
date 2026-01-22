@@ -39,7 +39,7 @@ const transporter = nodemailer.createTransport({
 });
 
 const accountSid = process.env.TWILIO_ACCOUNT_SID;
-const authToken =  process.env.TWILIO_ACCOUNT_TOKEN;
+const authToken = process.env.TWILIO_ACCOUNT_TOKEN;
 const twilioClient = twilio(accountSid, authToken);
 const twilioFrom = 'whatsapp:+62882005447472';
 
@@ -71,10 +71,10 @@ function getExpiredTimestamp(minutesFromNow = 1440) {
 
 function generateSignaturePOST(data, path) {
     const method = 'POST';
-    const paramsOrder = path.includes('/va') ? 
+    const paramsOrder = path.includes('/va') ?
         ['amount', 'expired', 'bank_code', 'partner_reff', 'customer_id', 'customer_name', 'customer_email', 'clientId'] :
-        path.includes('/qris') ? 
-        ['amount', 'expired', 'partner_reff', 'customer_id', 'customer_name', 'customer_email', 'clientId'] : [];
+        path.includes('/qris') ?
+            ['amount', 'expired', 'partner_reff', 'customer_id', 'customer_name', 'customer_email', 'clientId'] : [];
 
     let rawValue = paramsOrder.map(key => data[key] || '').join('');
     const cleaned = rawValue.replace(/[^0-9a-zA-Z]/g, "").toLowerCase();
@@ -164,7 +164,7 @@ async function insertOrderService(body, partnerReff) {
         [
             partnerReff, body.kontak.nama, body.kontak.telepon, body.kontak.email,
             body.layanan.nama, body.layanan.harga, body.lokasi, body.alamat, body.catatan || null,
-            extraServicesJson, extraServicesPrice, body.jenisGedung, body.biayaGedung, 
+            extraServicesJson, extraServicesPrice, body.jenisGedung, body.biayaGedung,
             body.totalBayar, body.metodePembayaran.name, body.metodePembayaran.code,
             body.kontak.nama, body.kontak.telepon, body.jadwal.tanggal, body.jadwal.jam,
             now, now
@@ -191,24 +191,24 @@ async function getCurrentStatusQris(partnerReff) {
 app.post('/create-va', async (req, res) => {
     console.log("-----------------------------------------");
     console.log("🚀 [REQUEST] /create-va", JSON.stringify(req.body));
-    
+
     try {
         const body = req.body;
         const partner_reff = generatePartnerReff();
         const expired = getExpiredTimestamp();
-        
+
         const orderServiceId = await insertOrderService(body, partner_reff);
-        
+
         const signature = generateSignaturePOST({
-            amount: body.totalBayar, expired, bank_code: body.metodePembayaran.code, 
-            partner_reff, customer_id: body.kontak.nama, customer_name: body.kontak.nama, 
+            amount: body.totalBayar, expired, bank_code: body.metodePembayaran.code,
+            partner_reff, customer_id: body.kontak.nama, customer_name: body.kontak.nama,
             customer_email: body.kontak.email, clientId
         }, '/transaction/create/va');
 
         const response = await axios.post('https://api.linkqu.id/linkqu-partner/transaction/create/va', {
             amount: body.totalBayar, bank_code: body.metodePembayaran.code, partner_reff,
             username, pin, expired, signature, customer_id: body.kontak.nama,
-            customer_name: body.kontak.nama, customer_email: body.kontak.email, 
+            customer_name: body.kontak.nama, customer_email: body.kontak.email,
             url_callback: "https://layanan.tangerangfast.online/callback"
         }, { headers: { 'client-id': clientId, 'client-secret': clientSecret } });
 
@@ -251,10 +251,10 @@ app.post('/create-va', async (req, res) => {
         </div>`;
 
         await sendEmailNotification(body.kontak.email, `Instruksi Pembayaran #${partner_reff}`, emailHTML);
-        
+
         res.json(result);
-    } catch (err) { 
-        res.status(500).json({ error: err.message }); 
+    } catch (err) {
+        res.status(500).json({ error: err.message });
     }
 });
 
@@ -266,7 +266,7 @@ app.post('/create-qris', async (req, res) => {
         const body = req.body;
         const partner_reff = generatePartnerReff();
         const expired = getExpiredTimestamp();
-        
+
         // 1. Simpan ke tabel utama order_service
         const orderServiceId = await insertOrderService(body, partner_reff);
 
@@ -280,7 +280,7 @@ app.post('/create-qris', async (req, res) => {
         console.log("📡 Sending Request to LinkQu API (QRIS)...");
         const response = await axios.post('https://api.linkqu.id/linkqu-partner/transaction/create/qris', {
             amount: body.totalBayar, partner_reff, username, pin, expired, signature,
-            customer_id: body.kontak.nama, customer_name: body.kontak.nama, 
+            customer_id: body.kontak.nama, customer_name: body.kontak.nama,
             customer_email: body.kontak.email, url_callback: "https://layanan.tangerangfast.online/callback"
         }, { headers: { 'client-id': clientId, 'client-secret': clientSecret } });
 
@@ -343,9 +343,9 @@ app.post('/create-qris', async (req, res) => {
         console.log("🏁 Process /create-qris Done.");
         res.json(result);
 
-    } catch (err) { 
+    } catch (err) {
         console.error("❌ [ERROR] /create-qris:", err.message);
-        res.status(500).json({ error: err.message }); 
+        res.status(500).json({ error: err.message });
     }
 });
 
@@ -353,9 +353,9 @@ app.post('/create-qris', async (req, res) => {
 app.post('/callback', async (req, res) => {
     console.log("-----------------------------------------");
     console.log("🔔 [CALLBACK RECEIVED] Data:", JSON.stringify(req.body));
-    
+
     const { partner_reff, va_code } = req.body;
-    
+
     try {
         // 1. Ambil data order dari database
         const orderData = await getOrderDetails(partner_reff);
@@ -376,11 +376,11 @@ app.post('/callback', async (req, res) => {
         // 2. Update Database
         console.log(`💾 Updating Database for #${partner_reff} (${methodType})...`);
         await db.execute(
-            `UPDATE ${table} SET status = 'SUKSES', callback_raw = ?, updated_at = NOW() WHERE partner_reff = ?`, 
+            `UPDATE ${table} SET status = 'SUKSES', callback_raw = ?, updated_at = NOW() WHERE partner_reff = ?`,
             [JSON.stringify(req.body), partner_reff]
         );
         await db.execute(
-            `UPDATE order_service SET order_status = 'PAID', updated_at = NOW() WHERE order_reff = ?`, 
+            `UPDATE order_service SET order_status = 'PAID', updated_at = NOW() WHERE order_reff = ?`,
             [partner_reff]
         );
 
@@ -438,8 +438,8 @@ app.post('/callback', async (req, res) => {
         // 4. NOTIFIKASI JAGEL
         try {
             await axios.post('https://api.jagel.id/v1/message/send', {
-                apikey: "z4PBduE9ocedWaaTUCKHnOl7C8yokkTB4catk7FMt5U2d4Lmyv", 
-                type: 'email', 
+                apikey: "z4PBduE9ocedWaaTUCKHnOl7C8yokkTB4catk7FMt5U2d4Lmyv",
+                type: 'email',
                 value: orderData.customer_email || ADMIN_EMAIL,
                 content: `✅ *PEMBAYARAN BERHASIL!*\n\nNomor: *${partner_reff}*\nLayanan: ${orderData.service_name}\nStatus: LUNAS`
             });
@@ -497,7 +497,7 @@ app.get('/download-qr/:partner_reff', async (req, res) => {
 // ⚡ ENDPOINT: Cek Status Transaksi LinkQu (Menggunakan endpoint sederhana)
 app.get('/check-status/:partnerReff', async (req, res) => {
     const partner_reff = req.params.partnerReff;
-    
+
     // Ambil detail order dari database
     const orderData = await getOrderDetails(partner_reff);
     if (!orderData) {
@@ -509,7 +509,7 @@ app.get('/check-status/:partnerReff', async (req, res) => {
         // Tentukan URL LinkQu sesuai dokumentasi cURL yang baru
         // URL Path: /linkqu-partner/transaction/payment/checkstatus
         const url = `https://api.linkqu.id/linkqu-partner/transaction/payment/checkstatus`;
-        
+
         const response = await axios.get(url, {
             params: {
                 username: username, // Menggunakan username dari konfigurasi global
@@ -528,14 +528,14 @@ app.get('/check-status/:partnerReff', async (req, res) => {
         if (linkquStatus.status_code === '00' || linkquStatus.status === 'SUKSES') {
             const methodCode = orderData.payment_code;
             const table = methodCode === 'QRIS' ? 'inquiry_qris' : 'inquiry_va';
-            
+
             // Hanya update jika status di DB saat ini masih PENDING
             if (orderData.order_status === 'PENDING_PAYMENT') {
-                 // Perbarui status di tabel inquiry (VA/QRIS) dan order_service
+                // Perbarui status di tabel inquiry (VA/QRIS) dan order_service
                 await db.execute(`UPDATE ${table} SET status = 'SUKSES', updated_at = NOW() WHERE partner_reff = ?`, [partner_reff]);
                 await db.execute(`UPDATE order_service SET order_status = 'PAID', updated_at = NOW() WHERE order_reff = ?`, [partner_reff]);
 
-              
+
             }
         }
 
@@ -546,7 +546,7 @@ app.get('/check-status/:partnerReff', async (req, res) => {
             // Status yang lebih user-friendly untuk frontend
             current_status: (linkquStatus.status_code === '00' || linkquStatus.status === 'SUKSES') ? 'PAID' : 'PENDING'
         });
-        
+
     } catch (err) {
         // Tangani error jika API LinkQu gagal dihubungi
         logToFile(`❌ Check Status API Error for ${partner_reff}: ${err.message}`);
@@ -577,17 +577,19 @@ app.get('/transaction-history', async (req, res) => {
     if (!email) return res.status(400).json({ error: "Email is required" });
 
     try {
+        // PERBAIKAN: Menambahkan ORDER BY created_at DESC agar yang terbaru selalu di atas
+        // Di file backend Anda
         const [orders] = await db.query(`
-            SELECT 
-                os.order_reff, os.service_name, os.total_amount, os.order_status, os.created_at, os.payment_method,
-                va.va_number, va.bank_name, va.expired as va_expired,
-                qr.qris_url, qr.expired as qr_expired
-            FROM order_service os
-            LEFT JOIN inquiry_va va ON os.order_reff = va.partner_reff
-            LEFT JOIN inquiry_qris qr ON os.order_reff = qr.partner_reff
-            WHERE os.customer_email = ?
-            ORDER BY os.created_at DESC
-        `, [email]);
+    SELECT 
+        os.*, 
+        va.va_number, va.bank_name, va.expired as va_expired,
+        qr.qris_url, qr.expired as qr_expired
+    FROM order_service os
+    LEFT JOIN inquiry_va va ON os.order_reff = va.partner_reff
+    LEFT JOIN inquiry_qris qr ON os.order_reff = qr.partner_reff
+    WHERE os.customer_email = ?
+    ORDER BY os.created_at DESC -- WAJIB: Agar data terbaru di atas
+`, [email]);
 
         const now = moment().tz('Asia/Jakarta').format('YYYYMMDDHHmmss');
 
@@ -595,7 +597,7 @@ app.get('/transaction-history', async (req, res) => {
             let status = order.order_status;
             const expiration = order.va_expired || order.qr_expired;
 
-            // Logika Status Gagal jika Expired
+            // Jika status masih pending tapi sudah lewat waktu expired
             if (status === 'PENDING_PAYMENT' && expiration && now > expiration) {
                 status = 'EXPIRED';
             }
