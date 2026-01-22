@@ -259,18 +259,25 @@ app.post('/create-va', async (req, res) => {
 });
 
 app.post('/create-qris', async (req, res) => {
+    console.log("-----------------------------------------");
+    console.log("🚀 [REQUEST] /create-qris", JSON.stringify(req.body));
+
     try {
         const body = req.body;
         const partner_reff = generatePartnerReff();
         const expired = getExpiredTimestamp();
         
+        // 1. Simpan ke tabel utama order_service
         const orderServiceId = await insertOrderService(body, partner_reff);
 
+        // 2. Generate Signature untuk LinkQu
         const signature = generateSignaturePOST({
             amount: body.totalBayar, expired, partner_reff, customer_id: body.kontak.nama,
             customer_name: body.kontak.nama, customer_email: body.kontak.email, clientId
         }, '/transaction/create/qris');
 
+        // 3. Tembak API LinkQu
+        console.log("📡 Sending Request to LinkQu API (QRIS)...");
         const response = await axios.post('https://api.linkqu.id/linkqu-partner/transaction/create/qris', {
             amount: body.totalBayar, partner_reff, username, pin, expired, signature,
             customer_id: body.kontak.nama, customer_name: body.kontak.nama, 
@@ -278,11 +285,29 @@ app.post('/create-qris', async (req, res) => {
         }, { headers: { 'client-id': clientId, 'client-secret': clientSecret } });
 
         const result = response.data;
+        console.log("✅ [LINKQU RES]", JSON.stringify(result));
 
-        await db.execute(`INSERT INTO inquiry_qris (order_service_id, partner_reff, customer_id, amount, expired, qris_url, response_raw, created_at, status) VALUES (?, ?, ?, ?, ?, ?, ?, NOW(), 'PENDING')`,
-            [orderServiceId, partner_reff, body.kontak.nama, body.totalBayar, expired, result?.imageqris, JSON.stringify(result)]);
+        // 4. DOWNLOAD GAMBAR QRIS UNTUK SIMPAN SEBAGAI BLOB
+        let qrisBuffer = null;
+        if (result?.imageqris) {
+            try {
+                console.log("📥 Downloading QRIS Image for BLOB storage...");
+                const imgRes = await axios.get(result.imageqris, { responseType: 'arraybuffer' });
+                qrisBuffer = Buffer.from(imgRes.data);
+                console.log("📂 QRIS converted to Buffer successfully.");
+            } catch (downloadErr) {
+                console.error("❌ Failed to download QRIS image for BLOB:", downloadErr.message);
+            }
+        }
 
-        // --- TEMPLATE EMAIL PROFESIONAL QRIS ---
+        // 5. Simpan ke tabel inquiry_qris (Termasuk kolom BLOB qris_image)
+        await db.execute(
+            `INSERT INTO inquiry_qris (order_service_id, partner_reff, customer_id, amount, expired, qris_url, qris_image, response_raw, created_at, status) 
+             VALUES (?, ?, ?, ?, ?, ?, ?, ?, NOW(), 'PENDING')`,
+            [orderServiceId, partner_reff, body.kontak.nama, body.totalBayar, expired, result?.imageqris, qrisBuffer, JSON.stringify(result)]
+        );
+
+        // 6. KIRIM EMAIL PROFESIONAL
         const detailJasa = body.jasaTambahan.length > 0 ? body.jasaTambahan.map(j => j.nama).join(', ') : '-';
         const emailHTML = `
         <div style="font-family: sans-serif; color: #333; max-width: 600px; margin: auto; border: 1px solid #eee; padding: 20px; border-radius: 15px;">
@@ -312,10 +337,14 @@ app.post('/create-qris', async (req, res) => {
             </div>
         </div>`;
 
+        console.log(`📧 Sending Professional Email QRIS to: ${body.kontak.email}`);
         await sendEmailNotification(body.kontak.email, `Tagihan Pembayaran QRIS #${partner_reff}`, emailHTML);
 
+        console.log("🏁 Process /create-qris Done.");
         res.json(result);
+
     } catch (err) { 
+        console.error("❌ [ERROR] /create-qris:", err.message);
         res.status(500).json({ error: err.message }); 
     }
 });
@@ -328,12 +357,14 @@ app.post('/callback', async (req, res) => {
     const { partner_reff, va_code } = req.body;
     
     try {
+        // 1. Ambil data order dari database
         const orderData = await getOrderDetails(partner_reff);
         if (!orderData) {
             console.warn(`⚠️ Order #${partner_reff} not found in database.`);
             return res.status(404).json({ error: "Order Not Found" });
         }
 
+        // Cegah proses ganda jika sudah lunas
         if (orderData.order_status === 'PAID') {
             console.log(`ℹ️ Order #${partner_reff} already marked as PAID. Skipping.`);
             return res.json({ message: "Done" });
@@ -342,6 +373,7 @@ app.post('/callback', async (req, res) => {
         const methodType = va_code === 'QRIS' ? 'QRIS' : 'VA';
         const table = methodType === 'QRIS' ? 'inquiry_qris' : 'inquiry_va';
 
+        // 2. Update Database
         console.log(`💾 Updating Database for #${partner_reff} (${methodType})...`);
         await db.execute(
             `UPDATE ${table} SET status = 'SUKSES', callback_raw = ?, updated_at = NOW() WHERE partner_reff = ?`, 
@@ -352,6 +384,7 @@ app.post('/callback', async (req, res) => {
             [partner_reff]
         );
 
+        // 3. Persiapkan Data untuk Notifikasi
         const totalFormatted = formatIDR(orderData.total_amount);
         let detailJasa = "-";
         if (orderData.extra_services) {
@@ -361,21 +394,58 @@ app.post('/callback', async (req, res) => {
             } catch (e) { detailJasa = "-"; }
         }
 
+        // --- TEMPLATE EMAIL SUKSES (E-RECEIPT) ---
+        const emailHtml = `
+        <div style="font-family: sans-serif; color: #333; max-width: 600px; margin: auto; border: 1px solid #eee; padding: 20px; border-radius: 15px;">
+            <div style="text-align: center; margin-bottom: 20px;">
+                <div style="background: #22c55e; width: 60px; height: 60px; line-height: 60px; border-radius: 50%; color: white; font-size: 30px; margin: 0 auto 10px;">✓</div>
+                <h2 style="color: #22c55e; margin: 0;">PEMBAYARAN BERHASIL</h2>
+                <p style="font-size: 14px; color: #666;">Terima kasih, pembayaran Anda telah kami terima.</p>
+            </div>
+
+            <div style="border-top: 2px dashed #eee; border-bottom: 2px dashed #eee; padding: 15px 0; margin: 20px 0;">
+                <table style="width: 100%; font-size: 14px;">
+                    <tr><td style="color: #999;">No. Referensi</td><td style="text-align: right; font-weight: bold;">${orderData.order_reff}</td></tr>
+                    <tr><td style="color: #999;">Tanggal Bayar</td><td style="text-align: right;">${moment().tz('Asia/Jakarta').format('DD MMM YYYY, HH:mm')} WIB</td></tr>
+                    <tr><td style="color: #999;">Metode Pembayaran</td><td style="text-align: right;">${orderData.payment_method} (${methodType})</td></tr>
+                </table>
+            </div>
+
+            <h3 style="font-size: 16px; border-bottom: 1px solid #eee; padding-bottom: 10px;">Detail Layanan</h3>
+            <table style="width: 100%; border-collapse: collapse; font-size: 14px;">
+                <tr><td style="padding: 8px 0;">Jenis Layanan</td><td style="text-align: right; font-weight: bold;">${orderData.service_name}</td></tr>
+                <tr><td style="padding: 8px 0;">Jasa Tambahan</td><td style="text-align: right;">${detailJasa}</td></tr>
+                <tr><td style="padding: 8px 0;">Jadwal Pelaksanaan</td><td style="text-align: right; font-weight: bold;">${orderData.schedule_date} | ${orderData.schedule_time}</td></tr>
+                <tr><td style="padding: 8px 0;">Lokasi</td><td style="text-align: right; font-size: 12px; color: #666;">${orderData.address}, ${orderData.location}</td></tr>
+                <tr style="font-size: 18px; color: #22c55e;">
+                    <td style="padding: 20px 0;"><b>Total Pelunasan</b></td>
+                    <td style="text-align: right; padding: 20px 0;"><b>${totalFormatted}</b></td>
+                </tr>
+            </table>
+
+            <div style="background: #f8fafc; padding: 15px; border-radius: 10px; font-size: 13px; line-height: 1.5;">
+                <p style="margin: 0;"><b>Informasi Selanjutnya:</b></p>
+                <p style="margin: 5px 0 0;">Petugas kami akan datang sesuai jadwal yang telah ditentukan. Mohon pastikan nomor telepon <b>${orderData.customer_phone}</b> aktif untuk koordinasi lebih lanjut.</p>
+            </div>
+
+            <p style="text-align: center; font-size: 12px; color: #999; margin-top: 25px;">
+                &copy; 2026 Kilau Fast Services. Semua Hak Dilindungi.
+            </p>
+        </div>`;
+
         console.log("🚀 Dispatching Notifications...");
 
         // 4. NOTIFIKASI JAGEL
         try {
-            console.log("- Sending Jagel Notif...");
             await axios.post('https://api.jagel.id/v1/message/send', {
                 apikey: "z4PBduE9ocedWaaTUCKHnOl7C8yokkTB4catk7FMt5U2d4Lmyv", 
                 type: 'email', 
                 value: orderData.customer_email || ADMIN_EMAIL,
-                content: `✅ *PEMBAYARAN BERHASIL!*\n\nInv: *${partner_reff}*\nLayanan: ${orderData.service_name}\nTotal: ${totalFormatted}`
+                content: `✅ *PEMBAYARAN BERHASIL!*\n\nNomor: *${partner_reff}*\nLayanan: ${orderData.service_name}\nStatus: LUNAS`
             });
         } catch (e) { console.error("❌ Jagel Notif Error:", e.message); }
 
         // 5. KIRIM WA CUSTOMER
-        console.log("- Sending WhatsApp Customer...");
         await sendWhatsAppCustomerSuccess(orderData.customer_phone, {
             1: orderData.customer_name,
             2: partner_reff,
@@ -386,10 +456,9 @@ app.post('/callback', async (req, res) => {
             7: totalFormatted
         });
 
-        // 6. KIRIM EMAIL DETAIL
-        console.log("- Sending Final Confirmation Email...");
-        const emailHtml = `<div style="font-family:sans-serif; padding:20px; border:1px solid #ddd; border-radius:10px;"> ... </div>`;
-        await sendEmailNotification(orderData.customer_email, `Lunas #${partner_reff}`, emailHtml);
+        // 6. KIRIM EMAIL DETAIL SUKSES
+        console.log("- Sending Professional Receipt Email...");
+        await sendEmailNotification(orderData.customer_email, `Konfirmasi Pelunasan #${partner_reff}`, emailHtml);
 
         console.log(`✅ [CALLBACK SUCCESS] #${partner_reff} processed.`);
         res.json({ message: "OK" });
