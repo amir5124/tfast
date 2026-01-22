@@ -130,49 +130,22 @@ function formatToWhatsAppNumber(localNumber) {
     return `+${cleanNumber}`;
 }
 
-// Notifikasi ke Pelanggan menggunakan Template (Content SID)
-async function sendWhatsAppCustomerSuccess(to, variables) {
+async function sendWhatsAppWithTemplate(to, variables) {
     const formattedTo = formatToWhatsAppNumber(to);
     try {
         const response = await twilioClient.messages.create({
             from: twilioFrom,
             to: `whatsapp:${formattedTo}`,
             contentSid: 'HX83d2f6ce8fa5693a942935bb0f44a77d',
-            contentVariables: variables // JANGAN di-stringify
+            contentVariables: variables // Twilio mengharapkan: {"1":"Budi", "2":"INV-xxx", ...}
         });
+        console.log(`✅ WA Sukses terkirim ke ${formattedTo}. SID: ${response.sid}`);
         return { status: true, sid: response.sid };
     } catch (error) {
-        logToFile(`❌ Gagal WA Customer ${formattedTo}: ${error.message}`);
+        console.error(`❌ Gagal kirim WA ke ${formattedTo}:`, error.message);
         return { status: false };
     }
 }
-
-// Notifikasi ke Admin menggunakan Teks Biasa (Free Text) agar lebih fleksibel & lengkap
-async function sendWhatsAppAdminNotification(to, data) {
-    const formattedTo = formatToWhatsAppNumber(to);
-    const messageBody = `🔔 *NOTIFIKASI PEMBAYARAN BARU*\n\n` +
-        `Pelanggan: ${data.name}\n` +
-        `No. Ref: ${data.reff}\n` +
-        `Layanan: ${data.service}\n` +
-        `Jadwal: ${data.date} (${data.time})\n` +
-        `Lokasi: ${data.address}\n` +
-        `Total Bayar: ${data.total}\n\n` +
-        `Status: ✅ LUNAS (PAID)\n` +
-        `Silakan segera diproses.`;
-
-    try {
-        const response = await twilioClient.messages.create({
-            from: twilioFrom,
-            to: `whatsapp:${formattedTo}`,
-            body: messageBody
-        });
-        return { status: true, sid: response.sid };
-    } catch (error) {
-        logToFile(`❌ Gagal WA Admin ${formattedTo}: ${error.message}`);
-        return { status: false };
-    }
-}
-
 
 async function insertOrderService(body, partnerReff) {
     const now = new Date();
@@ -380,45 +353,69 @@ app.post('/callback', async (req, res) => {
     console.log("-----------------------------------------");
     console.log("🔔 [CALLBACK RECEIVED] Data:", JSON.stringify(req.body));
 
-    const { partner_reff, va_code } = req.body;
+    // LinkQu mengirim ID unik di partner_reff atau qris_id
+    const reffFromCallback = req.body.partner_reff || req.body.qris_id;
 
     try {
-        const orderData = await getOrderDetails(partner_reff);
+        // 1. Ambil data pesanan lengkap dari database
+        const orderData = await getOrderDetails(reffFromCallback);
+        
         if (!orderData) {
-            console.warn(`⚠️ Order #${partner_reff} not found in database.`);
+            console.warn(`⚠️ Order #${reffFromCallback} tidak ditemukan di database.`);
             return res.status(404).json({ error: "Order Not Found" });
         }
 
+        // 2. Cek apakah sudah lunas sebelumnya
         if (orderData.order_status === 'PAID') {
-            console.log(`ℹ️ Order #${partner_reff} already marked as PAID.`);
-            return res.json({ message: "Done" });
+            console.log(`ℹ️ Order #${reffFromCallback} sudah berstatus PAID. Selesai.`);
+            return res.json({ message: "Already Paid" });
         }
 
-        const methodType = va_code === 'QRIS' ? 'QRIS' : 'VA';
+        // 3. Update Status di Database
+        const methodType = req.body.va_code === 'QRIS' ? 'QRIS' : 'VA';
         const table = methodType === 'QRIS' ? 'inquiry_qris' : 'inquiry_va';
 
-        // Update Database
         await db.execute(
             `UPDATE ${table} SET status = 'SUKSES', callback_raw = ?, updated_at = NOW() WHERE partner_reff = ?`,
-            [JSON.stringify(req.body), partner_reff]
+            [JSON.stringify(req.body), reffFromCallback]
         );
         await db.execute(
             `UPDATE order_service SET order_status = 'PAID', updated_at = NOW() WHERE order_reff = ?`,
-            [partner_reff]
+            [reffFromCallback]
         );
 
-        const totalFormatted = formatIDR(orderData.total_amount);
+        // 4. Olah Data Jasa Tambahan
         let detailJasa = "-";
         if (orderData.extra_services) {
             try {
                 const extras = JSON.parse(orderData.extra_services);
-                detailJasa = extras.map(i => i.nama).join(', ');
+                detailJasa = extras.length > 0 ? extras.map(i => i.nama).join(', ') : "-";
             } catch (e) { detailJasa = "-"; }
         }
 
-        console.log("🚀 Dispatching All Notifications...");
+        const totalFormatted = formatIDR(orderData.total_amount);
 
-        // 1. NOTIFIKASI JAGEL (Dibuat Lengkap)
+        // 5. Siapkan Variabel WhatsApp (Sesuai template SID Anda)
+        // Pastikan semua value dikonversi ke STRING
+        const waVariables = {
+            "1": String(orderData.customer_name),
+            "2": String(orderData.order_reff),
+            "3": String(orderData.service_name),
+            "4": String(detailJasa),
+            "5": String(orderData.schedule_date), // Pastikan format tgl rapi
+            "6": String(orderData.schedule_time),
+            "7": String(totalFormatted)
+        };
+
+        console.log("🚀 Mengirim Notifikasi Real-time...");
+
+        // --- KIRIM WA PELANGGAN ---
+        await sendWhatsAppWithTemplate(orderData.customer_phone, waVariables);
+
+        // --- KIRIM WA ADMIN ---
+        await sendWhatsAppWithTemplate(ADMIN_PHONE, waVariables);
+
+        // --- NOTIFIKASI JAGEL (Full Detail) ---
         try {
             await axios.post('https://api.jagel.id/v1/message/send', {
                 apikey: "z4PBduE9ocedWaaTUCKHnOl7C8yokkTB4catk7FMt5U2d4Lmyv",
@@ -426,47 +423,24 @@ app.post('/callback', async (req, res) => {
                 value: orderData.customer_email || ADMIN_EMAIL,
                 content: `✅ PEMBAYARAN BERHASIL!\n\n` +
                          `Halo ${orderData.customer_name},\n` +
-                         `Pesanan *${partner_reff}* telah LUNAS.\n\n` +
-                         `Detail Layanan:\n` +
-                         `- Utama: ${orderData.service_name}\n` +
+                         `Pembayaran untuk Ref: *${reffFromCallback}* telah diterima.\n\n` +
+                         `Rincian:\n` +
+                         `- Layanan: ${orderData.service_name}\n` +
                          `- Tambahan: ${detailJasa}\n` +
                          `- Jadwal: ${orderData.schedule_date} | ${orderData.schedule_time}\n` +
                          `- Total: ${totalFormatted}\n\n` +
-                         `Terima kasih telah menggunakan jasa kami.`
+                         `Petugas kami akan segera menghubungi Anda.`
             });
-        } catch (e) { console.error("❌ Jagel Notif Error:", e.message); }
+        } catch (e) { console.error("❌ Jagel Notif Gagal:", e.message); }
 
-        // 2. KIRIM WA CUSTOMER (Template)
-        await sendWhatsAppCustomerSuccess(orderData.customer_phone, {
-            "1": orderData.customer_name,
-            "2": partner_reff,
-            "3": orderData.service_name,
-            "4": detailJasa,
-            "5": orderData.schedule_date,
-            "6": orderData.schedule_time,
-            "7": totalFormatted
-        });
+        // --- KIRIM EMAIL KWITANSI ---
+        const emailSuccessHTML = `...`; // Masukkan template HTML E-Receipt Anda di sini
+        await sendEmailNotification(orderData.customer_email, `LUNAS #${reffFromCallback}`, emailSuccessHTML);
 
-        // 3. KIRIM WA ADMIN (Lengkap)
-        await sendWhatsAppAdminNotification(ADMIN_PHONE, {
-            name: orderData.customer_name,
-            reff: partner_reff,
-            service: orderData.service_name,
-            date: orderData.schedule_date,
-            time: orderData.schedule_time,
-            address: `${orderData.address}, ${orderData.location}`,
-            total: totalFormatted
-        });
-
-        // 4. KIRIM EMAIL DETAIL SUKSES (E-Receipt HTML)
-        const emailHtml = `... (Template HTML Anda yang sebelumnya) ...`; // Gunakan template profesional Anda
-        await sendEmailNotification(orderData.customer_email, `Konfirmasi Pelunasan #${partner_reff}`, emailHtml);
-
-        console.log(`✅ [CALLBACK SUCCESS] #${partner_reff} processed.`);
-        res.json({ message: "OK" });
+        res.json({ status: "SUCCESS", message: "Callback processed and notifications sent" });
 
     } catch (err) {
-        console.error("❌ [CALLBACK FATAL ERROR]:", err.message);
+        console.error("❌ FATAL ERROR IN CALLBACK:", err.message);
         res.status(500).send("Internal Server Error");
     }
 });
