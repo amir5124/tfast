@@ -13,39 +13,32 @@ const app = express();
 app.use(cors());
 app.use(express.json());
 
-// 🔐 Konfigurasi Kredensial Umum
+// --- CONFIGURATION ---
 const clientId = "088e21fc-de14-4df5-9008-f545ecd28ad1";
 const clientSecret = "p8OOlsOexX5AdDSOgHx1y65Bw";
 const username = "LI264GULM";
 const pin = "bCY3o1jPJe1JHcI";
 const serverKey = "AArMxIUKKz8WZfzdSXcILkiy";
-const API_KEY_JAGEL = "ISI_API_KEY_JAGEL_ANDA"; 
 
-// ADMIN DATA
 const ADMIN_PHONE = '6282323907426';
 const ADMIN_EMAIL = 'kilaufast@gmail.com';
 
-// 📧 Konfigurasi Nodemailer (FIXED: Port 465 SSL & TLS Fix)
 const transporter = nodemailer.createTransport({
     host: 'smtp.gmail.com',
     port: 465,
-    secure: true, // Port 587 HARUS false
+    secure: true,
     auth: {
         user: 'kilaufast@gmail.com',
         pass: 'xvtbjkrzjzriosca',
     },
-    tls: {
-        // Tetap gunakan ini agar tidak ditolak jika sertifikat server hosting Anda berbeda
-        rejectUnauthorized: false
-    }
+    tls: { rejectUnauthorized: false }
 });
-// 📱 Konfigurasi Twilio
+
 const accountSid = process.env.TWILIO_ACCOUNT_SID;
-const authToken =  process.env.TWILIO_ACCOUNT_TOKEN;
+const authToken = process.env.TWILIO_ACCOUNT_TOKEN;
 const twilioClient = twilio(accountSid, authToken);
 const twilioFrom = 'whatsapp:+62882005447472';
 
-// 🐘 Konfigurasi Database
 const db = mysql.createPool({
     host: '203.161.184.103',
     user: 'kilaugr1_layanan',
@@ -56,8 +49,25 @@ const db = mysql.createPool({
     queueLimit: 0
 });
 
-// --- FUNGSI UTILITY ---
+// --- MIDDLEWARE LOGGING GLOBAL ---
+app.use((req, res, next) => {
+    console.log(`\n--- [${moment().format('YYYY-MM-DD HH:mm:ss')}] NEW REQUEST ---`);
+    console.log(`Method: ${req.method} | URL: ${req.url}`);
+    if (Object.keys(req.body).length > 0) console.log('Body:', JSON.stringify(req.body, null, 2));
+    if (Object.keys(req.query).length > 0) console.log('Query:', JSON.stringify(req.query, null, 2));
+    
+    // Capture response data
+    const oldJson = res.json;
+    res.json = function(data) {
+        console.log(`--- [${moment().format('YYYY-MM-DD HH:mm:ss')}] RESPONSE ---`);
+        console.log(`Status: ${res.statusCode}`);
+        console.log('Payload:', JSON.stringify(data, null, 2));
+        return oldJson.apply(res, arguments);
+    };
+    next();
+});
 
+// --- UTILITY FUNCTIONS ---
 function logToFile(message) {
     const logPath = path.join(__dirname, 'stderr.log');
     const fullMessage = `[${new Date().toISOString()}] ${message}\n`;
@@ -91,7 +101,7 @@ function formatToWhatsAppNumber(num) {
     return `+${clean}`;
 }
 
-// 📧 FUNGSI EMAIL
+// --- NOTIFICATION FUNCTIONS ---
 async function sendEmailNotification(to, subject, htmlContent) {
     const recipient = (to && to.includes('@')) ? to : ADMIN_EMAIL;
     try {
@@ -103,7 +113,6 @@ async function sendEmailNotification(to, subject, htmlContent) {
     }
 }
 
-// 📱 FUNGSI WHATSAPP CUSTOMER (TEMPLATE ONLY)
 async function sendWhatsAppCustomerSuccess(to, variables) {
     const formattedTo = formatToWhatsAppNumber(to) || formatToWhatsAppNumber(ADMIN_PHONE);
     try {
@@ -120,7 +129,6 @@ async function sendWhatsAppCustomerSuccess(to, variables) {
     }
 }
 
-// 📱 FUNGSI WHATSAPP ADMIN
 async function sendWhatsAppAdminNotification(to, messageBody) {
     const formattedTo = formatToWhatsAppNumber(to) || formatToWhatsAppNumber(ADMIN_PHONE);
     try {
@@ -129,7 +137,6 @@ async function sendWhatsAppAdminNotification(to, messageBody) {
     } catch (error) { logToFile(`❌ Admin WA Error: ${error.message}`); return { status: false }; }
 }
 
-// 🔄 DATABASE HELPERS
 async function insertOrderService(body, partnerReff) {
     const extraServicesJson = body.jasaTambahan ? JSON.stringify(body.jasaTambahan) : null;
     const extraServicesPrice = body.jasaTambahan ? body.jasaTambahan.reduce((acc, curr) => acc + curr.harga, 0) : 0;
@@ -141,9 +148,7 @@ async function insertOrderService(body, partnerReff) {
     return result.insertId;
 }
 
-// ------------------------------------
-// ⚡ ENDPOINTS: TRANSAKSI
-// ------------------------------------
+// --- ENDPOINTS ---
 
 app.post('/create-va', async (req, res) => {
     try {
@@ -156,9 +161,12 @@ app.post('/create-va', async (req, res) => {
             amount: body.totalBayar, expired, bank_code: body.metodePembayaran.code, partner_reff, customer_id: body.kontak.nama, customer_name: body.kontak.nama, customer_email: body.kontak.email, clientId
         }, '/transaction/create/va');
 
+        console.log(`[LINKQU REQ] Creating VA for ${partner_reff}`);
         const response = await axios.post('https://api.linkqu.id/linkqu-partner/transaction/create/va', {
             amount: body.totalBayar, bank_code: body.metodePembayaran.code, partner_reff, username, pin, expired, signature, customer_id: body.kontak.nama, customer_name: body.kontak.nama, customer_email: body.kontak.email, url_callback: "https://layanan.linku.co.id/callback"
         }, { headers: { 'client-id': clientId, 'client-secret': clientSecret } });
+        
+        console.log(`[LINKQU RES]`, JSON.stringify(response.data, null, 2));
 
         await db.query('INSERT INTO inquiry_va SET ?', [{
             order_service_id: orderServiceId, partner_reff, customer_id: body.kontak.nama, amount: body.totalBayar, bank_name: body.metodePembayaran.name, expired, va_number: response.data?.virtual_account, created_at: new Date(), status: "PENDING"
@@ -166,7 +174,10 @@ app.post('/create-va', async (req, res) => {
 
         await sendEmailNotification(body.kontak.email, `Invoice #${partner_reff}`, `<h2>Invoice #${partner_reff}</h2><p>VA: ${response.data?.virtual_account}</p><p>Total: ${formatIDR(body.totalBayar)}</p>`);
         res.json(response.data);
-    } catch (err) { res.status(500).json({ error: err.message }); }
+    } catch (err) { 
+        console.error('❌ VA Error:', err.message);
+        res.status(500).json({ error: err.message }); 
+    }
 });
 
 app.post('/create-qris', async (req, res) => {
@@ -180,9 +191,12 @@ app.post('/create-qris', async (req, res) => {
             amount: body.totalBayar, expired, partner_reff, customer_id: body.kontak.nama, customer_name: body.kontak.nama, customer_email: body.kontak.email, clientId
         }, '/transaction/create/qris');
 
+        console.log(`[LINKQU REQ] Creating QRIS for ${partner_reff}`);
         const response = await axios.post('https://api.linkqu.id/linkqu-partner/transaction/create/qris', {
             amount: body.totalBayar, partner_reff, username, pin, expired, signature, customer_id: body.kontak.nama, customer_name: body.kontak.nama, customer_email: body.kontak.email, url_callback: "https://layanan.linku.co.id/callback"
         }, { headers: { 'client-id': clientId, 'client-secret': clientSecret } });
+        
+        console.log(`[LINKQU RES]`, JSON.stringify(response.data, null, 2));
 
         let qrisBuffer = null;
         if (response.data?.imageqris) {
@@ -195,33 +209,47 @@ app.post('/create-qris', async (req, res) => {
 
         await sendEmailNotification(body.kontak.email, `Invoice #${partner_reff}`, `<p>Silakan bayar QRIS: <a href="${response.data?.imageqris}">Klik Di Sini</a></p>`);
         res.json(response.data);
-    } catch (err) { res.status(500).json({ error: err.message }); }
+    } catch (err) { 
+        console.error('❌ QRIS Error:', err.message);
+        res.status(500).json({ error: err.message }); 
+    }
 });
 
-// ------------------------------------
-// ⚡ CALLBACK (DENGAN JAGEL NOTIF)
-// ------------------------------------
 app.post('/callback', async (req, res) => {
     const { partner_reff, va_code } = req.body;
+    console.log(`[CALLBACK RECEIVED] Reff: ${partner_reff} | Code: ${va_code}`);
+    
     try {
         const [rows] = await db.query('SELECT * FROM order_service WHERE order_reff = ?', [partner_reff]);
         const orderData = rows[0];
-        if (!orderData || orderData.order_status === 'PAID') return res.json({ message: "Done" });
+        
+        if (!orderData) {
+            console.log(`⚠️ Order ${partner_reff} not found in database.`);
+            return res.json({ message: "Order not found" });
+        }
+        
+        if (orderData.order_status === 'PAID') {
+            console.log(`ℹ️ Order ${partner_reff} already processed.`);
+            return res.json({ message: "Already PAID" });
+        }
 
         const table = va_code === 'QRIS' ? 'inquiry_qris' : 'inquiry_va';
         await db.execute(`UPDATE ${table} SET status = 'SUKSES', updated_at = NOW() WHERE partner_reff = ?`, [partner_reff]);
         await db.execute(`UPDATE order_service SET order_status = 'PAID', updated_at = NOW() WHERE order_reff = ?`, [partner_reff]);
 
-        // Fallback Logic
         const customerName = orderData.customer_name || "Pelanggan";
         const serviceName = orderData.service_name || "-";
         const totalAmountFormatted = formatIDR(orderData.total_amount);
         let detailJasa = "-";
+        
         if (orderData.extra_services) {
-            try { const extras = JSON.parse(orderData.extra_services); detailJasa = extras.map(i => i.nama).join(', '); } catch (e) {}
+            try { 
+                const extras = JSON.parse(orderData.extra_services); 
+                detailJasa = extras.map(i => i.nama).join(', '); 
+            } catch (e) { console.error('JSON Parse Error:', e.message); }
         }
 
-        // 1. Jagel Notification
+        // Jagel Notification
         try {
             await axios.post('https://api.jagel.id/v1/message/send', {
                 apikey: "z4PBduE9ocedWaaTUCKHnOl7C8yokkTB4catk7FMt5U2d4Lmyv", type: 'email', value: orderData.customer_email || ADMIN_EMAIL,
@@ -229,22 +257,18 @@ app.post('/callback', async (req, res) => {
             });
         } catch (e) { logToFile(`Jagel Error: ${e.message}`); }
 
-        // 2. WhatsApp Customer (Template)
+        // WhatsApp & Email
         await sendWhatsAppCustomerSuccess(orderData.customer_phone, { 1: customerName, 2: partner_reff, 3: serviceName, 4: detailJasa, 5: orderData.schedule_date, 6: orderData.schedule_time, 7: totalAmountFormatted });
-
-        // 3. WhatsApp Admin
         await sendWhatsAppAdminNotification(ADMIN_PHONE, `✅ *PEMBAYARAN MASUK*\nInv: ${partner_reff}\nCust: ${customerName}\nTotal: ${totalAmountFormatted}`);
-
-        // 4. Email Konfirmasi
         await sendEmailNotification(orderData.customer_email, `Lunas #${partner_reff}`, `<h3>Terima Kasih</h3><p>Pesanan ${partner_reff} lunas.</p>`);
 
-        res.json({ message: "OK" });
-    } catch (err) { logToFile(`Callback Error: ${err.message}`); res.status(500).send("Error"); }
+        res.json({ status: "SUCCESS", message: "Callback processed successfully" });
+    } catch (err) { 
+        logToFile(`Callback Error: ${err.message}`); 
+        console.error('❌ Callback Processing Failed:', err.message);
+        res.status(500).send("Internal Server Error"); 
+    }
 });
-
-// ------------------------------------
-// ⚡ ENDPOINTS: LIST & STATUS (LENGKAP)
-// ------------------------------------
 
 app.get('/va-list', async (req, res) => {
     const { username } = req.query;
@@ -265,9 +289,11 @@ app.get('/qr-list', async (req, res) => {
 app.get('/check-status/:partnerReff', async (req, res) => {
     const partner_reff = req.params.partnerReff;
     try {
+        console.log(`[STATUS CHECK] Reff: ${partner_reff}`);
         const response = await axios.get(`https://api.linkqu.id/linkqu-partner/transaction/payment/checkstatus`, {
             params: { username, partnerreff: partner_reff }, headers: { 'client-id': clientId, 'client-secret': clientSecret }
         });
+        
         if (response.data.status_code === '00') {
             await db.execute(`UPDATE order_service SET order_status = 'PAID' WHERE order_reff = ?`, [partner_reff]);
         }
@@ -294,16 +320,30 @@ app.get('/download-qr/:partner_reff', async (req, res) => {
     try {
         const [check] = await db.query('SELECT qris_image, qris_url FROM inquiry_qris WHERE partner_reff = ?', [partner_reff]);
         let buffer = check[0]?.qris_image;
+        
         if (!buffer && check[0]?.qris_url) {
             const response = await axios.get(check[0].qris_url, { responseType: 'arraybuffer' });
             buffer = Buffer.from(response.data);
             await db.query('UPDATE inquiry_qris SET qris_image = ? WHERE partner_reff = ?', [buffer, partner_reff]);
         }
-        res.setHeader('Content-Disposition', `attachment; filename="qris-${partner_reff}.png"`);
+
+        if (!buffer) return res.status(404).send('QR Code tidak ditemukan');
+
+        // Header agar file terunduh otomatis
         res.setHeader('Content-Type', 'image/png');
+        res.setHeader('Content-Disposition', `attachment; filename="qris-${partner_reff}.png"`);
+        // Tambahan agar CORS tidak menghalangi download di beberapa browser
+        res.setHeader('Access-Control-Expose-Headers', 'Content-Disposition');
+        
         res.send(buffer);
-    } catch (err) { res.status(500).send('Error'); }
+    } catch (err) { 
+        console.error('❌ Download Error:', err.message);
+        res.status(500).send('Error downloading QR'); 
+    }
 });
 
 const PORT = 3000;
-app.listen(PORT, () => console.log(`🚀 Server TangerangFast on port ${PORT}`));
+app.listen(PORT, () => {
+    console.log(`🚀 Server TangerangFast running on port ${PORT}`);
+    console.log(`📅 Started at: ${moment().format('YYYY-MM-DD HH:mm:ss')}`);
+});
