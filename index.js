@@ -595,7 +595,6 @@ app.get('/transaction-history', async (req, res) => {
             let status = order.order_status;
             const expiration = order.va_expired || order.qr_expired;
 
-            // Logika Expired
             if (status === 'PENDING_PAYMENT' && expiration && now > expiration) {
                 status = 'EXPIRED';
             }
@@ -605,10 +604,11 @@ app.get('/transaction-history', async (req, res) => {
                 order_status: status,
                 formatted_amount: new Intl.NumberFormat('id-ID', { style: 'currency', currency: 'IDR', minimumFractionDigits: 0 }).format(order.total_amount),
                 
-                // FIX TANGGAL JADWAL: Memastikan tanggal pengerjaan bersih (DD MMM YYYY)
+                // FIX TANGGAL JADWAL: Hilangkan format jam yang berantakan
                 formatted_schedule: moment(order.schedule_date).format('DD MMM YYYY'),
                 
-                // FIX JAM CREATED_AT: Memaksa ke zona waktu Asia/Jakarta agar jam tidak bergeser
+                // FIX JAM CREATED_AT: Paksa ke WIB (Asia/Jakarta)
+                // Jika masih selisih, gunakan .add(7, 'hours') secara manual jika server Anda tidak mendukung timezone
                 date_label: moment(order.created_at).tz('Asia/Jakarta').format('DD MMM YYYY, HH:mm')
             };
         });
