@@ -137,7 +137,8 @@ async function sendWhatsAppWithTemplate(to, variables) {
             from: twilioFrom,
             to: `whatsapp:${formattedTo}`,
             contentSid: 'HX83d2f6ce8fa5693a942935bb0f44a77d',
-            contentVariables: variables // Twilio mengharapkan: {"1":"Budi", "2":"INV-xxx", ...}
+            // Twilio Node Helper membutuhkan object murni
+            contentVariables: variables 
         });
         console.log(`✅ WA Sukses terkirim ke ${formattedTo}. SID: ${response.sid}`);
         return { status: true, sid: response.sid };
@@ -357,34 +358,42 @@ app.post('/callback', async (req, res) => {
     const reffFromCallback = req.body.partner_reff || req.body.qris_id;
 
     try {
-        // 1. Ambil data pesanan lengkap dari database
-        const orderData = await getOrderDetails(reffFromCallback);
+        // 1. Ambil data pesanan dari tabel order_service
+        const [orders] = await db.execute(
+            'SELECT * FROM order_service WHERE order_reff = ?', 
+            [reffFromCallback]
+        );
         
+        const orderData = orders[0];
+
         if (!orderData) {
             console.warn(`⚠️ Order #${reffFromCallback} tidak ditemukan di database.`);
             return res.status(404).json({ error: "Order Not Found" });
         }
 
-        // 2. Cek apakah sudah lunas sebelumnya
+        // 2. Cek status (Cegah pengiriman notifikasi berulang jika LinkQu kirim callback 2x)
         if (orderData.order_status === 'PAID') {
-            console.log(`ℹ️ Order #${reffFromCallback} sudah berstatus PAID. Selesai.`);
-            return res.json({ message: "Already Paid" });
+            console.log(`ℹ️ Order #${reffFromCallback} sudah LUNAS. Melewati pengiriman notifikasi.`);
+            return res.json({ message: "Already Processed" });
         }
 
-        // 3. Update Status di Database
+        // 3. Update Status di Database (Tabel Log & Tabel Utama)
         const methodType = req.body.va_code === 'QRIS' ? 'QRIS' : 'VA';
-        const table = methodType === 'QRIS' ? 'inquiry_qris' : 'inquiry_va';
+        const logTable = methodType === 'QRIS' ? 'inquiry_qris' : 'inquiry_va';
 
+        // Update Tabel Log Pembayaran
         await db.execute(
-            `UPDATE ${table} SET status = 'SUKSES', callback_raw = ?, updated_at = NOW() WHERE partner_reff = ?`,
+            `UPDATE ${logTable} SET status = 'SUKSES', callback_raw = ?, updated_at = NOW() WHERE partner_reff = ?`,
             [JSON.stringify(req.body), reffFromCallback]
         );
+
+        // Update Tabel Utama order_service
         await db.execute(
             `UPDATE order_service SET order_status = 'PAID', updated_at = NOW() WHERE order_reff = ?`,
             [reffFromCallback]
         );
 
-        // 4. Olah Data Jasa Tambahan
+        // 4. Olah Jasa Tambahan (Parsing LongText JSON)
         let detailJasa = "-";
         if (orderData.extra_services) {
             try {
@@ -393,26 +402,26 @@ app.post('/callback', async (req, res) => {
             } catch (e) { detailJasa = "-"; }
         }
 
-        const totalFormatted = formatIDR(orderData.total_amount);
+        // Format Rupiah (Jika fungsi formatIDR Anda sudah ada)
+        const totalFormatted = new Intl.NumberFormat('id-ID', { style: 'currency', currency: 'IDR', minimumFractionDigits: 0 }).format(orderData.total_amount);
 
-        // 5. Siapkan Variabel WhatsApp (Sesuai template SID Anda)
-        // Pastikan semua value dikonversi ke STRING
+        // 5. Siapkan Variabel WhatsApp (Sesuai Placeholder {{1}} - {{7}} di Twilio)
         const waVariables = {
             "1": String(orderData.customer_name),
             "2": String(orderData.order_reff),
             "3": String(orderData.service_name),
             "4": String(detailJasa),
-            "5": String(orderData.schedule_date), // Pastikan format tgl rapi
+            "5": String(moment(orderData.schedule_date).format('DD MMM YYYY')), // Format: 25 Jan 2026
             "6": String(orderData.schedule_time),
             "7": String(totalFormatted)
         };
 
-        console.log("🚀 Mengirim Notifikasi Real-time...");
+        console.log("🚀 Dispatching Notifications...");
 
         // --- KIRIM WA PELANGGAN ---
         await sendWhatsAppWithTemplate(orderData.customer_phone, waVariables);
 
-        // --- KIRIM WA ADMIN ---
+        // --- KIRIM WA ADMIN (Gunakan nomor admin yang terdaftar) ---
         await sendWhatsAppWithTemplate(ADMIN_PHONE, waVariables);
 
         // --- NOTIFIKASI JAGEL (Full Detail) ---
@@ -423,24 +432,23 @@ app.post('/callback', async (req, res) => {
                 value: orderData.customer_email || ADMIN_EMAIL,
                 content: `✅ PEMBAYARAN BERHASIL!\n\n` +
                          `Halo ${orderData.customer_name},\n` +
-                         `Pembayaran untuk Ref: *${reffFromCallback}* telah diterima.\n\n` +
+                         `Pembayaran Ref: ${orderData.order_reff} LUNAS.\n\n` +
                          `Rincian:\n` +
                          `- Layanan: ${orderData.service_name}\n` +
                          `- Tambahan: ${detailJasa}\n` +
-                         `- Jadwal: ${orderData.schedule_date} | ${orderData.schedule_time}\n` +
+                         `- Jadwal: ${moment(orderData.schedule_date).format('DD MMM YYYY')} | ${orderData.schedule_time}\n` +
                          `- Total: ${totalFormatted}\n\n` +
-                         `Petugas kami akan segera menghubungi Anda.`
+                         `Petugas kami akan segera datang sesuai jadwal.`
             });
         } catch (e) { console.error("❌ Jagel Notif Gagal:", e.message); }
 
-        // --- KIRIM EMAIL KWITANSI ---
-        const emailSuccessHTML = `...`; // Masukkan template HTML E-Receipt Anda di sini
-        await sendEmailNotification(orderData.customer_email, `LUNAS #${reffFromCallback}`, emailSuccessHTML);
+        // --- KIRIM EMAIL KWITANSI (Optional) ---
+        // await sendEmailNotification(orderData.customer_email, `LUNAS #${reffFromCallback}`, "...");
 
-        res.json({ status: "SUCCESS", message: "Callback processed and notifications sent" });
+        res.json({ status: "SUCCESS" });
 
     } catch (err) {
-        console.error("❌ FATAL ERROR IN CALLBACK:", err.message);
+        console.error("❌ CALLBACK ERROR:", err.message);
         res.status(500).send("Internal Server Error");
     }
 });
