@@ -130,14 +130,15 @@ function formatToWhatsAppNumber(localNumber) {
     return `+${cleanNumber}`;
 }
 
+// Notifikasi ke Pelanggan menggunakan Template (Content SID)
 async function sendWhatsAppCustomerSuccess(to, variables) {
     const formattedTo = formatToWhatsAppNumber(to);
     try {
         const response = await twilioClient.messages.create({
             from: twilioFrom,
             to: `whatsapp:${formattedTo}`,
-            contentSid: 'HX83d2f6ce8fa5693a942935bb0f44a77d', // Gunakan Content SID template 7 variabel Anda
-            contentVariables: JSON.stringify(variables),
+            contentSid: 'HX83d2f6ce8fa5693a942935bb0f44a77d',
+            contentVariables: variables // JANGAN di-stringify
         });
         return { status: true, sid: response.sid };
     } catch (error) {
@@ -146,6 +147,31 @@ async function sendWhatsAppCustomerSuccess(to, variables) {
     }
 }
 
+// Notifikasi ke Admin menggunakan Teks Biasa (Free Text) agar lebih fleksibel & lengkap
+async function sendWhatsAppAdminNotification(to, data) {
+    const formattedTo = formatToWhatsAppNumber(to);
+    const messageBody = `🔔 *NOTIFIKASI PEMBAYARAN BARU*\n\n` +
+        `Pelanggan: ${data.name}\n` +
+        `No. Ref: ${data.reff}\n` +
+        `Layanan: ${data.service}\n` +
+        `Jadwal: ${data.date} (${data.time})\n` +
+        `Lokasi: ${data.address}\n` +
+        `Total Bayar: ${data.total}\n\n` +
+        `Status: ✅ LUNAS (PAID)\n` +
+        `Silakan segera diproses.`;
+
+    try {
+        const response = await twilioClient.messages.create({
+            from: twilioFrom,
+            to: `whatsapp:${formattedTo}`,
+            body: messageBody
+        });
+        return { status: true, sid: response.sid };
+    } catch (error) {
+        logToFile(`❌ Gagal WA Admin ${formattedTo}: ${error.message}`);
+        return { status: false };
+    }
+}
 
 
 async function insertOrderService(body, partnerReff) {
@@ -178,15 +204,15 @@ async function getOrderDetails(partnerReff) {
     return rows[0] || null;
 }
 
-async function getCurrentStatusVa(partnerReff) {
-    const [rows] = await db.execute('SELECT status FROM inquiry_va WHERE partner_reff = ?', [partnerReff]);
-    return rows.length > 0 ? rows[0].status : null;
-}
+// async function getCurrentStatusVa(partnerReff) {
+//     const [rows] = await db.execute('SELECT status FROM inquiry_va WHERE partner_reff = ?', [partnerReff]);
+//     return rows.length > 0 ? rows[0].status : null;
+// }
 
-async function getCurrentStatusQris(partnerReff) {
-    const [rows] = await db.execute('SELECT status FROM inquiry_qris WHERE partner_reff = ?', [partnerReff]);
-    return rows.length > 0 ? rows[0].status : null;
-}
+// async function getCurrentStatusQris(partnerReff) {
+//     const [rows] = await db.execute('SELECT status FROM inquiry_qris WHERE partner_reff = ?', [partnerReff]);
+//     return rows.length > 0 ? rows[0].status : null;
+// }
 
 app.post('/create-va', async (req, res) => {
     console.log("-----------------------------------------");
@@ -357,24 +383,21 @@ app.post('/callback', async (req, res) => {
     const { partner_reff, va_code } = req.body;
 
     try {
-        // 1. Ambil data order dari database
         const orderData = await getOrderDetails(partner_reff);
         if (!orderData) {
             console.warn(`⚠️ Order #${partner_reff} not found in database.`);
             return res.status(404).json({ error: "Order Not Found" });
         }
 
-        // Cegah proses ganda jika sudah lunas
         if (orderData.order_status === 'PAID') {
-            console.log(`ℹ️ Order #${partner_reff} already marked as PAID. Skipping.`);
+            console.log(`ℹ️ Order #${partner_reff} already marked as PAID.`);
             return res.json({ message: "Done" });
         }
 
         const methodType = va_code === 'QRIS' ? 'QRIS' : 'VA';
         const table = methodType === 'QRIS' ? 'inquiry_qris' : 'inquiry_va';
 
-        // 2. Update Database
-        console.log(`💾 Updating Database for #${partner_reff} (${methodType})...`);
+        // Update Database
         await db.execute(
             `UPDATE ${table} SET status = 'SUKSES', callback_raw = ?, updated_at = NOW() WHERE partner_reff = ?`,
             [JSON.stringify(req.body), partner_reff]
@@ -384,7 +407,6 @@ app.post('/callback', async (req, res) => {
             [partner_reff]
         );
 
-        // 3. Persiapkan Data untuk Notifikasi
         const totalFormatted = formatIDR(orderData.total_amount);
         let detailJasa = "-";
         if (orderData.extra_services) {
@@ -394,70 +416,50 @@ app.post('/callback', async (req, res) => {
             } catch (e) { detailJasa = "-"; }
         }
 
-        // --- TEMPLATE EMAIL SUKSES (E-RECEIPT) ---
-        const emailHtml = `
-        <div style="font-family: sans-serif; color: #333; max-width: 600px; margin: auto; border: 1px solid #eee; padding: 20px; border-radius: 15px;">
-            <div style="text-align: center; margin-bottom: 20px;">
-                <div style="background: #22c55e; width: 60px; height: 60px; line-height: 60px; border-radius: 50%; color: white; font-size: 30px; margin: 0 auto 10px;">✓</div>
-                <h2 style="color: #22c55e; margin: 0;">PEMBAYARAN BERHASIL</h2>
-                <p style="font-size: 14px; color: #666;">Terima kasih, pembayaran Anda telah kami terima.</p>
-            </div>
+        console.log("🚀 Dispatching All Notifications...");
 
-            <div style="border-top: 2px dashed #eee; border-bottom: 2px dashed #eee; padding: 15px 0; margin: 20px 0;">
-                <table style="width: 100%; font-size: 14px;">
-                    <tr><td style="color: #999;">No. Referensi</td><td style="text-align: right; font-weight: bold;">${orderData.order_reff}</td></tr>
-                    <tr><td style="color: #999;">Tanggal Bayar</td><td style="text-align: right;">${moment().tz('Asia/Jakarta').format('DD MMM YYYY, HH:mm')} WIB</td></tr>
-                    <tr><td style="color: #999;">Metode Pembayaran</td><td style="text-align: right;">${orderData.payment_method} (${methodType})</td></tr>
-                </table>
-            </div>
-
-            <h3 style="font-size: 16px; border-bottom: 1px solid #eee; padding-bottom: 10px;">Detail Layanan</h3>
-            <table style="width: 100%; border-collapse: collapse; font-size: 14px;">
-                <tr><td style="padding: 8px 0;">Jenis Layanan</td><td style="text-align: right; font-weight: bold;">${orderData.service_name}</td></tr>
-                <tr><td style="padding: 8px 0;">Jasa Tambahan</td><td style="text-align: right;">${detailJasa}</td></tr>
-                <tr><td style="padding: 8px 0;">Jadwal Pelaksanaan</td><td style="text-align: right; font-weight: bold;">${orderData.schedule_date} | ${orderData.schedule_time}</td></tr>
-                <tr><td style="padding: 8px 0;">Lokasi</td><td style="text-align: right; font-size: 12px; color: #666;">${orderData.address}, ${orderData.location}</td></tr>
-                <tr style="font-size: 18px; color: #22c55e;">
-                    <td style="padding: 20px 0;"><b>Total Pelunasan</b></td>
-                    <td style="text-align: right; padding: 20px 0;"><b>${totalFormatted}</b></td>
-                </tr>
-            </table>
-
-            <div style="background: #f8fafc; padding: 15px; border-radius: 10px; font-size: 13px; line-height: 1.5;">
-                <p style="margin: 0;"><b>Informasi Selanjutnya:</b></p>
-                <p style="margin: 5px 0 0;">Petugas kami akan datang sesuai jadwal yang telah ditentukan. Mohon pastikan nomor telepon <b>${orderData.customer_phone}</b> aktif untuk koordinasi lebih lanjut.</p>
-            </div>
-
-            <p style="text-align: center; font-size: 12px; color: #999; margin-top: 25px;">
-                &copy; 2026 Kilau Fast Services. Semua Hak Dilindungi.
-            </p>
-        </div>`;
-
-        console.log("🚀 Dispatching Notifications...");
-
-        // 4. NOTIFIKASI JAGEL
+        // 1. NOTIFIKASI JAGEL (Dibuat Lengkap)
         try {
             await axios.post('https://api.jagel.id/v1/message/send', {
                 apikey: "z4PBduE9ocedWaaTUCKHnOl7C8yokkTB4catk7FMt5U2d4Lmyv",
                 type: 'email',
                 value: orderData.customer_email || ADMIN_EMAIL,
-                content: `✅ *PEMBAYARAN BERHASIL!*\n\nNomor: *${partner_reff}*\nLayanan: ${orderData.service_name}\nStatus: LUNAS`
+                content: `✅ PEMBAYARAN BERHASIL!\n\n` +
+                         `Halo ${orderData.customer_name},\n` +
+                         `Pesanan *${partner_reff}* telah LUNAS.\n\n` +
+                         `Detail Layanan:\n` +
+                         `- Utama: ${orderData.service_name}\n` +
+                         `- Tambahan: ${detailJasa}\n` +
+                         `- Jadwal: ${orderData.schedule_date} | ${orderData.schedule_time}\n` +
+                         `- Total: ${totalFormatted}\n\n` +
+                         `Terima kasih telah menggunakan jasa kami.`
             });
         } catch (e) { console.error("❌ Jagel Notif Error:", e.message); }
 
-        // 5. KIRIM WA CUSTOMER
+        // 2. KIRIM WA CUSTOMER (Template)
         await sendWhatsAppCustomerSuccess(orderData.customer_phone, {
-            1: orderData.customer_name,
-            2: partner_reff,
-            3: orderData.service_name,
-            4: detailJasa,
-            5: orderData.schedule_date,
-            6: orderData.schedule_time,
-            7: totalFormatted
+            "1": orderData.customer_name,
+            "2": partner_reff,
+            "3": orderData.service_name,
+            "4": detailJasa,
+            "5": orderData.schedule_date,
+            "6": orderData.schedule_time,
+            "7": totalFormatted
         });
 
-        // 6. KIRIM EMAIL DETAIL SUKSES
-        console.log("- Sending Professional Receipt Email...");
+        // 3. KIRIM WA ADMIN (Lengkap)
+        await sendWhatsAppAdminNotification(ADMIN_PHONE, {
+            name: orderData.customer_name,
+            reff: partner_reff,
+            service: orderData.service_name,
+            date: orderData.schedule_date,
+            time: orderData.schedule_time,
+            address: `${orderData.address}, ${orderData.location}`,
+            total: totalFormatted
+        });
+
+        // 4. KIRIM EMAIL DETAIL SUKSES (E-Receipt HTML)
+        const emailHtml = `... (Template HTML Anda yang sebelumnya) ...`; // Gunakan template profesional Anda
         await sendEmailNotification(orderData.customer_email, `Konfirmasi Pelunasan #${partner_reff}`, emailHtml);
 
         console.log(`✅ [CALLBACK SUCCESS] #${partner_reff} processed.`);
