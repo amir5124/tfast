@@ -577,19 +577,17 @@ app.get('/transaction-history', async (req, res) => {
     if (!email) return res.status(400).json({ error: "Email is required" });
 
     try {
-        // PERBAIKAN: Menambahkan ORDER BY created_at DESC agar yang terbaru selalu di atas
-        // Di file backend Anda
         const [orders] = await db.query(`
-    SELECT 
-        os.*, 
-        va.va_number, va.bank_name, va.expired as va_expired,
-        qr.qris_url, qr.expired as qr_expired
-    FROM order_service os
-    LEFT JOIN inquiry_va va ON os.order_reff = va.partner_reff
-    LEFT JOIN inquiry_qris qr ON os.order_reff = qr.partner_reff
-    WHERE os.customer_email = ?
-    ORDER BY os.created_at DESC -- WAJIB: Agar data terbaru di atas
-`, [email]);
+            SELECT 
+                os.*, 
+                va.va_number, va.bank_name, va.expired as va_expired,
+                qr.qris_url, qr.expired as qr_expired
+            FROM order_service os
+            LEFT JOIN inquiry_va va ON os.order_reff = va.partner_reff
+            LEFT JOIN inquiry_qris qr ON os.order_reff = qr.partner_reff
+            WHERE os.customer_email = ?
+            ORDER BY os.created_at DESC
+        `, [email]);
 
         const now = moment().tz('Asia/Jakarta').format('YYYYMMDDHHmmss');
 
@@ -597,7 +595,7 @@ app.get('/transaction-history', async (req, res) => {
             let status = order.order_status;
             const expiration = order.va_expired || order.qr_expired;
 
-            // Jika status masih pending tapi sudah lewat waktu expired
+            // Logika Expired
             if (status === 'PENDING_PAYMENT' && expiration && now > expiration) {
                 status = 'EXPIRED';
             }
@@ -605,8 +603,13 @@ app.get('/transaction-history', async (req, res) => {
             return {
                 ...order,
                 order_status: status,
-                formatted_amount: formatIDR(order.total_amount),
-                date_label: moment(order.created_at).format('DD MMM YYYY, HH:mm')
+                formatted_amount: new Intl.NumberFormat('id-ID', { style: 'currency', currency: 'IDR', minimumFractionDigits: 0 }).format(order.total_amount),
+                
+                // FIX TANGGAL JADWAL: Memastikan tanggal pengerjaan bersih (DD MMM YYYY)
+                formatted_schedule: moment(order.schedule_date).format('DD MMM YYYY'),
+                
+                // FIX JAM CREATED_AT: Memaksa ke zona waktu Asia/Jakarta agar jam tidak bergeser
+                date_label: moment(order.created_at).tz('Asia/Jakarta').format('DD MMM YYYY, HH:mm')
             };
         });
 
