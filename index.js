@@ -574,14 +574,23 @@ app.get('/qr-list', async (req, res) => {
 
 app.get('/transaction-history', async (req, res) => {
     const { email } = req.query;
-    if (!email) return res.status(400).json({ error: "Email is required" });
+    
+    // Validasi input email
+    if (!email) {
+        return res.status(400).json({ error: "Email is required" });
+    }
 
     try {
+        // Query database dengan JOIN untuk mengambil data VA dan QRIS sekaligus
+        // ORDER BY created_at DESC memastikan riwayat terbaru ada di posisi paling atas
         const [orders] = await db.query(`
             SELECT 
                 os.*, 
-                va.va_number, va.bank_name, va.expired as va_expired,
-                qr.qris_url, qr.expired as qr_expired
+                va.va_number, 
+                va.bank_name, 
+                va.expired as va_expired,
+                qr.qris_url, 
+                qr.expired as qr_expired
             FROM order_service os
             LEFT JOIN inquiry_va va ON os.order_reff = va.partner_reff
             LEFT JOIN inquiry_qris qr ON os.order_reff = qr.partner_reff
@@ -589,33 +598,58 @@ app.get('/transaction-history', async (req, res) => {
             ORDER BY os.created_at DESC
         `, [email]);
 
-        const now = moment().tz('Asia/Jakarta').format('YYYYMMDDHHmmss');
+        // Ambil waktu sekarang dalam format LinkQu (YYYYMMDDHHmmss) untuk cek expired
+        const nowFormatted = moment().tz('Asia/Jakarta').format('YYYYMMDDHHmmss');
 
         const history = orders.map(order => {
             let status = order.order_status;
             const expiration = order.va_expired || order.qr_expired;
 
-            if (status === 'PENDING_PAYMENT' && expiration && now > expiration) {
-                status = 'EXPIRED';
+            // Logika Penentuan Status EXPIRED secara real-time
+            // Jika di DB masih PENDING tapi waktu sekarang sudah melewati batas bayar LinkQu
+            if (status === 'PENDING' && expiration && nowFormatted > expiration) {
+                status = 'EXPIRED'; // Anda bisa mengubah tampilan di frontend berdasarkan label ini
             }
 
+            // Gabungkan rincian data untuk dikirim ke Frontend
             return {
                 ...order,
+                // Status yang sudah diproses logika expired
                 order_status: status,
-                formatted_amount: new Intl.NumberFormat('id-ID', { style: 'currency', currency: 'IDR', minimumFractionDigits: 0 }).format(order.total_amount),
                 
-                // FIX TANGGAL JADWAL: Hilangkan format jam yang berantakan
+                // Format mata uang Rupiah yang rapi
+                formatted_amount: new Intl.NumberFormat('id-ID', { 
+                    style: 'currency', 
+                    currency: 'IDR', 
+                    minimumFractionDigits: 0 
+                }).format(order.total_amount),
+                
+                // FIX TANGGAL PESAN (Created At): 
+                // Paksa menggunakan timezone Asia/Jakarta agar tidak selisih 7 jam dengan UTC
+                date_label: moment(order.created_at).tz('Asia/Jakarta').format('DD MMM YYYY, HH:mm'),
+                
+                // FIX TANGGAL JADWAL (Schedule Date):
+                // Mengonversi tipe data DATE database menjadi string yang cantik
                 formatted_schedule: moment(order.schedule_date).format('DD MMM YYYY'),
                 
-                // FIX JAM CREATED_AT: Paksa ke WIB (Asia/Jakarta)
-                // Jika masih selisih, gunakan .add(7, 'hours') secara manual jika server Anda tidak mendukung timezone
-                date_label: moment(order.created_at).tz('Asia/Jakarta').format('DD MMM YYYY, HH:mm')
+                // PARSING JASA TAMBAHAN (JSON parsing):
+                // Karena di DB tipenya LongText/String, kita ubah kembali jadi Array agar frontend bisa looping
+                extra_services_list: order.extra_services ? JSON.parse(order.extra_services) : [],
+                
+                // Tambahan: Informasi kadaluarsa dalam format yang bisa dibaca manusia
+                formatted_expiration: expiration ? moment(expiration, "YYYYMMDDHHmmss").format('DD MMM, HH:mm') : '-'
             };
         });
 
+        // Kirim data riwayat ke Client
         res.json(history);
+
     } catch (err) {
-        res.status(500).json({ error: err.message });
+        console.error("❌ Error fetch history:", err.message);
+        res.status(500).json({ 
+            error: "Gagal mengambil data riwayat", 
+            message: err.message 
+        });
     }
 });
 
