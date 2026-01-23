@@ -190,8 +190,7 @@ async function getOrderDetails(partnerReff) {
 
 app.post('/create-pay-saldo', async (req, res) => {
     console.log("-----------------------------------------");
-    console.log("🚀 [INCOMING REQUEST] /create-pay-saldo");
-    console.log("📦 Payload:", JSON.stringify(req.body));
+    console.log("🚀 [PROCESS] Pembayaran Saldo Jagel");
 
     const JAGEL_API_KEY = 'z4PBduE9ocedWaaTUCKHnOl7C8yokkTB4catk7FMt5U2d4Lmyv';
 
@@ -200,147 +199,71 @@ app.post('/create-pay-saldo', async (req, res) => {
         const userEmail = body.kontak?.email;
         const totalBayar = body.totalBayar;
 
-        // Validasi awal data input
-        if (!userEmail || !totalBayar) {
-            console.error("❌ [VALIDATION ERROR] Email atau Total Bayar kosong");
-            return res.status(400).json({ error: "Data kontak atau nominal tidak lengkap" });
-        }
-
-        // --- STEP 1: CEK SALDO KE JAGEL ---
-        console.log(`🔍 [STEP 1] Checking balance for: ${userEmail}`);
-        
-        const checkRes = await axios.post('https://api.jagel.id/v1/balance/check', {
-            type: "email",
-            value: userEmail,
-            apikey: JAGEL_API_KEY
-        }, { 
-            headers: { 'Accept': 'application/json', 'Content-Type': 'application/json' },
-            timeout: 10000 // Timeout 10 detik
-        });
-
-        // Debugging jika Jagel kirim HTML (Error 500/404)
-        if (typeof checkRes.data === 'string' && checkRes.data.includes('<html>')) {
-            console.error("⛔ [JAGEL ERROR] Server Jagel mengirim HTML, bukan JSON. Cek API Key/Endpoint.");
-            throw new Error("Server Jagel memberikan respon tidak valid (HTML).");
-        }
-
-        console.log("📩 [JAGEL RESPONSE - CHECK]:", checkRes.data);
-        const currentBalance = checkRes.data.balance || 0;
-
-        if (currentBalance < totalBayar) {
-            console.warn(`⚠️ [INSUFFICIENT BALANCE] User: ${userEmail}, Balance: ${currentBalance}, Need: ${totalBayar}`);
-            return res.status(400).json({
-                status: 'error',
-                message: `Saldo tidak mencukupi. Saldo Anda: Rp${currentBalance.toLocaleString()}, Dibutuhkan: Rp${totalBayar.toLocaleString()}`
-            });
-        }
-
-        // --- STEP 2: GENERATE REFF & DATA ---
-        console.log("🛠️ [STEP 2] Generating references and notes...");
+        // 1. Generate Referensi Unik
         const partner_reff = typeof generatePartnerReff === 'function' ? generatePartnerReff() : `TF${Date.now()}`;
         
-        const detailJasaStr = body.jasaTambahan?.length > 0
-            ? body.jasaTambahan.map(j => j.nama).join(', ')
-            : 'Tanpa tambahan';
-
-        const catatanJagel = `Bayar: ${body.layanan?.nama} | Jadwal: ${body.jadwal?.tanggal} | Reff: ${partner_reff}`;
-
-        // --- STEP 3: POTONG SALDO (ADJUST BALANCE) ---
-        console.log(`💸 [STEP 3] Deducting balance: -${totalBayar}`);
+        // 2. Potong Saldo (Adjust Balance)
+        console.log(`💸 Memotong saldo user: ${userEmail} sebesar ${totalBayar}`);
         const adjustRes = await axios.post('https://api.jagel.id/v1/balance/adjust', {
             type: "email",
             value: userEmail,
             apikey: JAGEL_API_KEY,
-            amount: -totalBayar, // Nilai negatif untuk memotong saldo
-            adjust_balance_admin: 1, 
-            note: catatanJagel
+            amount: -totalBayar, // Nilai negatif untuk pengurangan
+            adjust_balance_admin: 1,
+            note: `Pembayaran ${body.layanan.nama} - Reff: ${partner_reff}`
         }, { headers: { 'Accept': 'application/json' } });
 
-        console.log("📩 [JAGEL RESPONSE - ADJUST]:", adjustRes.data);
-
         if (adjustRes.data.status !== 'success') {
-            console.error("❌ [JAGEL ERROR] Adjustment failed:", adjustRes.data);
-            throw new Error(`Jagel Error: ${adjustRes.data.message || "Gagal memotong saldo"}`);
+            return res.status(400).json({ status: 'error', message: "Gagal memotong saldo di server Jagel." });
         }
 
-        // --- STEP 4: SIMPAN KE DATABASE ---
-        console.log("💾 [STEP 4] Saving to Database...");
-        let orderServiceId;
+        // 3. Simpan ke Database
+        console.log("💾 Menyimpan data pesanan ke database...");
+        const orderServiceId = await insertOrderService(body, partner_reff);
+        
+        // Set status langsung PAID
+        await db.query('UPDATE order_service SET order_status = "PAID" WHERE id = ?', [orderServiceId]);
+
+        // Log ke inquiry_va (untuk history)
+        await db.query('INSERT INTO inquiry_va SET ?', [{
+            order_service_id: orderServiceId,
+            partner_reff,
+            customer_id: body.kontak.nama,
+            amount: totalBayar,
+            bank_name: "SALDO JAGEL",
+            va_number: "PAID_VIA_SALDO",
+            status: "PAID",
+            created_at: new Date()
+        }]);
+
+        // 4. Kirim Notifikasi Pesan Internal Jagel
         try {
-            // 1. Simpan pesanan utama
-            orderServiceId = await insertOrderService(body, partner_reff);
+            const detailJasa = body.jasaTambahan.length > 0 ? body.jasaTambahan.map(j => j.nama).join(', ') : "-";
             
-            // 2. Simpan log inquiry sebagai PAID
-            const inquiryData = {
-                order_service_id: orderServiceId,
-                partner_reff,
-                customer_id: body.kontak.nama,
-                amount: totalBayar,
-                bank_name: "SALDO JAGEL",
-                expired: typeof getExpiredTimestamp === 'function' ? getExpiredTimestamp() : new Date(),
-                va_number: "PAID_VIA_SALDO",
-                response_raw: JSON.stringify(adjustRes.data),
-                created_at: new Date(),
-                status: "PAID"
-            };
-
-            await db.query('INSERT INTO inquiry_va SET ?', [inquiryData]);
-
-            // 3. Update status pesanan langsung menjadi PAID
-            await db.query('UPDATE order_service SET order_status = "PAID" WHERE id = ?', [orderServiceId]);
-            
-            console.log("✅ Database record complete (Order + Inquiry + Status PAID)");
-
-        } catch (dbErr) {
-            console.error("❌ [DATABASE ERROR]:", dbErr.message);
-            // Catatan: Saldo sudah terpotong di Jagel, jika DB gagal ini butuh penanganan manual/log khusus
-            throw new Error("Saldo terpotong namun gagal menyimpan data ke database. Hubungi Admin.");
+            await axios.post('https://api.jagel.id/v1/message/send', {
+                apikey: JAGEL_API_KEY,
+                type: 'email',
+                value: userEmail,
+                content: `✅ PEMBAYARAN BERHASIL (LUNAS)\n\n` +
+                         `Halo ${body.kontak.nama},\n` +
+                         `Pesanan #${partner_reff} telah lunas menggunakan Saldo.\n\n` +
+                         `Detail:\n` +
+                         `- Layanan: ${body.layanan.nama}\n` +
+                         `- Jasa Tambahan: ${detailJasa}\n` +
+                         `- Jadwal: ${body.jadwal.tanggal} ${body.jadwal.jam}\n` +
+                         `- Total: Rp${totalBayar.toLocaleString()}\n\n` +
+                         `Teknisi kami akan segera memproses pesanan Anda. Terima kasih!`
+            });
+            console.log("✅ Notifikasi Jagel Terkirim");
+        } catch (msgErr) {
+            console.error("⚠️ Gagal kirim notifikasi Jagel:", msgErr.message);
         }
 
-        // --- STEP 5: KIRIM EMAIL NOTIFIKASI ---
-        console.log("📧 [STEP 5] Sending confirmation email...");
-        try {
-            const emailHTML = `
-                <div style="font-family: sans-serif; color: #333; max-width: 600px; margin: auto; border: 1px solid #eee; padding: 25px; border-radius: 15px;">
-                    <div style="text-align: center; margin-bottom: 20px;">
-                        <h2 style="color: #22c55e;">PEMBAYARAN BERHASIL</h2>
-                        <p style="color: #666;">ID Transaksi: ${partner_reff}</p>
-                    </div>
-                    <p>Halo <b>${body.kontak.nama}</b>,</p>
-                    <p>Pembayaran menggunakan <b>Saldo</b> untuk layanan <b>${body.layanan.nama}</b> telah lunas diverifikasi.</p>
-                    <table style="width: 100%; border-top: 1px solid #eee; margin-top: 15px;">
-                        <tr><td style="padding: 10px 0;">Total Bayar</td><td style="text-align: right; font-weight: bold; color: #22c55e;">Rp${totalBayar.toLocaleString()}</td></tr>
-                    </table>
-                    <p style="font-size: 12px; color: #999; text-align: center; margin-top: 20px;">Pesanan Anda sedang kami proses. Terima kasih!</p>
-                </div>`;
-
-            await sendEmailNotification(userEmail, `Lunas: Pembayaran #${partner_reff}`, emailHTML);
-            console.log("✅ Email Notification Sent");
-        } catch (mailErr) {
-            console.warn("⚠️ [EMAIL WARNING] Email gagal terkirim, tapi transaksi tetap sukses:", mailErr.message);
-        }
-
-        res.json({ 
-            status: 'success', 
-            message: 'Pembayaran berhasil menggunakan saldo', 
-            partner_reff 
-        });
+        res.json({ status: 'success', partner_reff, message: "Pembayaran Berhasil" });
 
     } catch (err) {
-        console.error("🔥 [FATAL ERROR] /create-pay-saldo:");
-        if (err.response) {
-            // Error dari Axios (HTTP Error)
-            console.error("API Response Data:", err.response.data);
-            console.error("API Status Code:", err.response.status);
-        } else {
-            console.error("System Error Stack:", err.stack);
-        }
-        
-        res.status(500).json({ 
-            status: 'error', 
-            error: "Gagal memproses pembayaran saldo",
-            message: err.message 
-        });
+        console.error("🔥 [FATAL ERROR]:", err.message);
+        res.status(500).json({ status: 'error', message: "Terjadi kesalahan sistem pembayaran saldo." });
     }
 });
 
