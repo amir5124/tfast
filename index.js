@@ -472,12 +472,13 @@ app.post('/callback', async (req, res) => {
         }
 
         // 2. Cek status lunas (Cegah duplikasi)
+        // Jika sudah PAID, segera hentikan proses agar WA/Email tidak terkirim lagi
         if (orderData.order_status === 'PAID') {
             console.log(`ℹ️ Order #${reffFromCallback} sudah LUNAS.`);
             return res.json({ message: "Already Processed" });
         }
 
-        // 3. Update Database
+        // 3. Update Database (Lakukan SEBELUM notifikasi dikirim)
         const methodType = req.body.va_code === 'QRIS' ? 'QRIS' : 'VA';
         const logTable = methodType === 'QRIS' ? 'inquiry_qris' : 'inquiry_va';
 
@@ -485,10 +486,14 @@ app.post('/callback', async (req, res) => {
             `UPDATE ${logTable} SET status = 'SUKSES', callback_raw = ?, updated_at = NOW() WHERE partner_reff = ?`,
             [JSON.stringify(req.body), reffFromCallback]
         );
+        
+        // PENTING: Update status menjadi PAID di sini agar callback susulan tertolak di Poin 2
         await db.execute(
             `UPDATE order_service SET order_status = 'PAID', updated_at = NOW() WHERE order_reff = ?`,
             [reffFromCallback]
         );
+
+        console.log(`✅ Order #${reffFromCallback} set to PAID. Preparing notifications...`);
 
         // 4. Olah Data Detail & Format Tanggal (Fix: Rabu, 28 Jan 2026)
         let detailJasa = "-";
@@ -503,7 +508,6 @@ app.post('/callback', async (req, res) => {
             style: 'currency', currency: 'IDR', minimumFractionDigits: 0
         }).format(orderData.total_amount);
 
-        // Format Tanggal Indonesia: "Rabu, 28 Jan 2026"
         const tglJadwal = moment(orderData.schedule_date).locale('id').format('dddd, DD MMM YYYY');
         const waktuJadwal = `${tglJadwal} pukul ${orderData.schedule_time} WIB`;
 
@@ -518,7 +522,6 @@ app.post('/callback', async (req, res) => {
             "7": String(totalFormatted)
         };
 
-        // --- TEMPLATE EMAIL E-RECEIPT ---
         // --- TEMPLATE EMAIL E-RECEIPT ---
         const emailHtml = `
 <div style="font-family: sans-serif; color: #333; max-width: 600px; margin: auto; border: 1px solid #eee; padding: 20px; border-radius: 15px;">
