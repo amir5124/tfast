@@ -188,6 +188,108 @@ async function getOrderDetails(partnerReff) {
 //     return rows.length > 0 ? rows[0].status : null;
 // }
 
+app.post('/create-pay-saldo', async (req, res) => {
+    console.log("-----------------------------------------");
+    console.log("🚀 [REQUEST] /create-pay-saldo", JSON.stringify(req.body));
+
+    const JAGEL_API_KEY = 'z4PBduE9ocedWaaTUCKHnOl7C8yokkTB4catk7FMt5U2d4Lmyv'; // Ganti dengan API Key Jagel Anda
+
+    try {
+        const body = req.body;
+        const userEmail = body.kontak.email; // Email diambil dari body request
+        const totalBayar = body.totalBayar;
+
+        // 1. CEK SALDO KE JAGEL
+        const checkRes = await axios.post('https://api.jagel.id/v1/balance/check', {
+            type: "email",
+            value: userEmail,
+            apikey: JAGEL_API_KEY
+        }, { headers: { 'Accept': 'application/json' } });
+
+        const currentBalance = checkRes.data.balance || 0;
+
+        // Validasi kecukupan saldo
+        if (currentBalance < totalBayar) {
+            return res.status(400).json({
+                status: 'error',
+                message: `Saldo tidak mencukupi. Saldo Anda: ${currentBalance}, Dibutuhkan: ${totalBayar}`
+            });
+        }
+
+        // 2. KURANGI SALDO (ADJUST BALANCE)
+        const partner_reff = generatePartnerReff();
+
+        // Membuat catatan detail untuk di Jagel
+        const detailJasaStr = body.jasaTambahan.length > 0
+            ? body.jasaTambahan.map(j => j.nama).join(', ')
+            : 'Tanpa tambahan';
+
+        // Gabungkan informasi penting ke dalam satu string note
+        const catatanJagel = `Bayar: ${body.layanan.nama} | ` +
+            `Jadwal: ${body.jadwal.tanggal} ${body.jadwal.jam} | ` +
+            `Tambahan: ${detailJasaStr} | ` +
+            `Alamat: ${body.alamat} | ` +
+            `Reff: ${partner_reff}`;
+
+        const adjustRes = await axios.post('https://api.jagel.id/v1/balance/adjust', {
+            type: "email",
+            value: userEmail,
+            apikey: JAGEL_API_KEY,
+            amount: -totalBayar, // Nilai negatif untuk memotong saldo
+            note: catatanJagel // <--- Catatan detail dimasukkan di sini
+        }, { headers: { 'Accept': 'application/json' } });
+
+        if (adjustRes.data.status !== 'success') {
+            throw new Error("Gagal memotong saldo user.");
+        }
+
+        // 3. SIMPAN KE DATABASE (Status langsung PAID karena saldo sudah dipotong)
+        const orderServiceId = await insertOrderService(body, partner_reff);
+
+        await db.query('INSERT INTO inquiry_va SET ?', [{
+            order_service_id: orderServiceId,
+            partner_reff,
+            customer_id: body.kontak.nama,
+            amount: totalBayar,
+            bank_name: "SALDO JAGEL",
+            expired: getExpiredTimestamp(),
+            va_number: "PAID_VIA_SALDO",
+            response_raw: JSON.stringify(adjustRes.data),
+            created_at: new Date(),
+            status: "PAID" // Langsung lunas
+        }]);
+
+        // 4. KIRIM EMAIL KONFIRMASI LUNAS
+        const emailHTML = `
+        <div style="font-family: sans-serif; color: #333; max-width: 600px; margin: auto; border: 1px solid #eee; padding: 20px; border-radius: 15px;">
+            <div style="text-align: center; margin-bottom: 20px;">
+                <h2 style="color: #28a745; margin: 0;">PEMBAYARAN BERHASIL</h2>
+                <p style="font-size: 12px; color: #999;">ID Transaksi: ${partner_reff}</p>
+            </div>
+            <p>Halo <b>${body.kontak.nama}</b>,</p>
+            <p>Pembayaran Anda menggunakan <b>Saldo</b> telah berhasil diverifikasi.</p>
+            
+            <table style="width: 100%; border-collapse: collapse; margin-bottom: 20px;">
+                <tr style="border-bottom: 1px solid #eee;"><td style="padding: 10px 0;">Metode</td><td style="text-align: right; font-weight: bold;">Saldo Jagel</td></tr>
+                <tr style="border-bottom: 1px solid #eee;"><td style="padding: 10px 0;">Layanan</td><td style="text-align: right; font-weight: bold;">${body.layanan.nama}</td></tr>
+                <tr><td style="padding: 15px 0; font-size: 18px;"><b>Total Bayar</b></td><td style="text-align: right; font-size: 18px; color: #28a745;"><b>${formatIDR(totalBayar)}</b></td></tr>
+            </table>
+
+            <p style="text-align: center; background: #f0fff4; color: #155724; padding: 10px; border-radius: 5px;">
+                Pesanan Anda sedang kami proses. Terima kasih!
+            </p>
+        </div>`;
+
+        await sendEmailNotification(userEmail, `Pembayaran Berhasil #${partner_reff}`, emailHTML);
+
+        res.json({ status: 'success', message: 'Pembayaran berhasil menggunakan saldo', partner_reff });
+
+    } catch (err) {
+        console.error("❌ [ERROR] Saldo Payment:", err.response?.data || err.message);
+        res.status(500).json({ error: "Terjadi kesalahan pada sistem pembayaran saldo" });
+    }
+});
+
 app.post('/create-va', async (req, res) => {
     console.log("-----------------------------------------");
     console.log("🚀 [REQUEST] /create-va", JSON.stringify(req.body));
