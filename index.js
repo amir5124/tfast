@@ -606,59 +606,50 @@ app.get('/download-qr/:partner_reff', async (req, res) => {
 app.get('/check-status/:partnerReff', async (req, res) => {
     const partner_reff = req.params.partnerReff;
 
-    // Ambil detail order dari database
-    const orderData = await getOrderDetails(partner_reff);
-    if (!orderData) {
-        logToFile(`❌ Check Status: Order ${partner_reff} Not Found in database`);
-        return res.status(404).json({ error: "Order Not Found in database" });
-    }
-
     try {
-        // Tentukan URL LinkQu sesuai dokumentasi cURL yang baru
-        // URL Path: /linkqu-partner/transaction/payment/checkstatus
-        const url = `https://api.linkqu.id/linkqu-partner/transaction/payment/checkstatus`;
+        // 1. Ambil detail order dari database
+        const orderData = await getOrderDetails(partner_reff);
+        if (!orderData) {
+            return res.status(404).json({ error: "Order Not Found" });
+        }
 
+        // 2. Hitung status ke LinkQu
+        const url = `https://api.linkqu.id/linkqu-partner/transaction/payment/checkstatus`;
         const response = await axios.get(url, {
             params: {
-                username: username, // Menggunakan username dari konfigurasi global
+                username: username,
                 partnerreff: partner_reff
             },
             headers: {
-                'client-id': clientId, // Menggunakan clientId dari konfigurasi global
-                'client-secret': clientSecret // Menggunakan clientSecret dari konfigurasi global
+                'client-id': clientId,
+                'client-secret': clientSecret
             }
         });
 
         const linkquStatus = response.data;
-        const statusAPI = linkquStatus.status || linkquStatus.status_code; // Status '00' = Success
-
-        // Logika untuk memperbarui status di database jika LinkQu mengonfirmasi SUKSES
+        
+        // 3. Logika Update Database jika Lunas
+        // Status '00' atau 'SUKSES' dari LinkQu berarti pembayaran berhasil
         if (linkquStatus.status_code === '00' || linkquStatus.status === 'SUKSES') {
-            const methodCode = orderData.payment_code;
-            const table = methodCode === 'QRIS' ? 'inquiry_qris' : 'inquiry_va';
-
-            // Hanya update jika status di DB saat ini masih PENDING
             if (orderData.order_status === 'PENDING_PAYMENT') {
-                // Perbarui status di tabel inquiry (VA/QRIS) dan order_service
+                const table = orderData.payment_code === 'QRIS' ? 'inquiry_qris' : 'inquiry_va';
+                
                 await db.execute(`UPDATE ${table} SET status = 'SUKSES', updated_at = NOW() WHERE partner_reff = ?`, [partner_reff]);
                 await db.execute(`UPDATE order_service SET order_status = 'PAID', updated_at = NOW() WHERE order_reff = ?`, [partner_reff]);
-
-
+                
+                orderData.order_status = 'PAID'; // Update local variable for response
             }
         }
 
-        // Kembalikan respons dari LinkQu ke frontend
+        // 4. Respon ke Frontend
         res.json({
             partner_reff: partner_reff,
-            linkqu_response: linkquStatus,
-            // Status yang lebih user-friendly untuk frontend
-            current_status: (linkquStatus.status_code === '00' || linkquStatus.status === 'SUKSES') ? 'PAID' : 'PENDING'
+            current_status: orderData.order_status === 'PAID' ? 'PAID' : 'PENDING',
+            detail: linkquStatus
         });
 
     } catch (err) {
-        // Tangani error jika API LinkQu gagal dihubungi
-        logToFile(`❌ Check Status API Error for ${partner_reff}: ${err.message}`);
-        res.status(500).json({ error: "Failed to check status with LinkQu API", detail: err.message });
+        res.status(500).json({ error: "API LinkQu Error", detail: err.message });
     }
 });
 
