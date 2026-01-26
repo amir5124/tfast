@@ -481,35 +481,49 @@ app.post('/callback', async (req, res) => {
             } catch (e) { detailJasa = "-"; }
         }
 
-        const totalFormatted = new Intl.NumberFormat('id-ID', {
-            style: 'currency', currency: 'IDR', minimumFractionDigits: 0
-        }).format(orderData.total_amount);
 
-        // 1. Definisikan Fallback jika tanggal kosong
+        // Fungsi Sanitasi: Menghapus karakter yang sering bikin API WA Error (Tab, Enter, Spasi Ganda)
+        const clean = (val) => {
+            if (!val) return "-";
+            return String(val)
+                .replace(/[\t\n\r]/g, ' ') // Hapus Tab, Newline, Carriage Return
+                .replace(/\s+/g, ' ')      // Gabungkan spasi ganda menjadi satu
+                .trim() || "-";
+        };
+
         const rawDate = orderData.schedule_date || new Date();
-
-        // 2. Format dengan Moment
         let tglJadwal = moment(rawDate).locale('id').format('dddd, DD MMM YYYY');
 
-        // 3. SANITASI TOTAL: Pastikan tidak ada "Invalid date" dan hapus karakter aneh
         if (tglJadwal === "Invalid date") {
-            tglJadwal = "-"; // Atau format manual jika perlu
+            tglJadwal = "-";
         }
 
-        // Tambahan: Bersihkan spasi ganda atau karakter tab tersembunyi
-        tglJadwal = tglJadwal.replace(/\s+/g, ' ').trim();
-        const waktuJadwal = `${tglJadwal} pukul ${orderData.schedule_time} WIB`;
+        // Bersihkan tglJadwal dari karakter aneh
+        tglJadwal = clean(tglJadwal);
 
-        // 5. Siapkan Variabel WhatsApp
+        const totalFormatted = new Intl.NumberFormat('id-ID', {
+            style: 'currency', currency: 'IDR', minimumFractionDigits: 0
+        }).format(orderData.total_amount || 0).replace(/\u00A0/g, ' ');
+
+        const waktuJadwal = `${tglJadwal} pukul ${orderData.schedule_time || "-"} WIB`;
+
+        // --- 5. SIAPKAN VARIABEL WHATSAPP ---
         const waVariables = {
-            "1": String(orderData.customer_name),
-            "2": String(orderData.order_reff),
-            "3": String(orderData.service_name),
-            "4": String(detailJasa),
-            "5": String(tglJadwal),
-            "6": String(orderData.schedule_time),
-            "7": String(totalFormatted)
+            "1": clean(orderData.customer_name),
+            "2": clean(orderData.order_reff),
+            "3": clean(orderData.service_name),
+            "4": clean(detailJasa),
+            "5": clean(tglJadwal),
+            "6": clean(orderData.schedule_time),
+            "7": clean(totalFormatted)
         };
+
+        // --- LOG PAYLOAD UNTUK DEBUGGING (JSON STRINGIFY) ---
+        console.log("-----------------------------------------");
+        console.log("📤 [DEBUG WA PAYLOAD]:", JSON.stringify(waVariables, null, 2));
+        console.log("-----------------------------------------");
+
+        console.log("🚀 Dispatching Notifications...");
 
         // --- TEMPLATE EMAIL E-RECEIPT ---
         const emailHtml = `
