@@ -201,7 +201,7 @@ app.post('/create-pay-saldo', async (req, res) => {
 
         // 1. Generate Referensi Unik
         const partner_reff = typeof generatePartnerReff === 'function' ? generatePartnerReff() : `TF${Date.now()}`;
-        
+
         // 2. Potong Saldo (Adjust Balance)
         console.log(`💸 Memotong saldo user: ${userEmail} sebesar ${totalBayar}`);
         const adjustRes = await axios.post('https://api.jagel.id/v1/balance/adjust', {
@@ -220,7 +220,7 @@ app.post('/create-pay-saldo', async (req, res) => {
         // 3. Simpan ke Database
         console.log("💾 Menyimpan data pesanan ke database...");
         const orderServiceId = await insertOrderService(body, partner_reff);
-        
+
         // Set status langsung PAID
         await db.query('UPDATE order_service SET order_status = "PAID" WHERE id = ?', [orderServiceId]);
 
@@ -239,20 +239,20 @@ app.post('/create-pay-saldo', async (req, res) => {
         // 4. Kirim Notifikasi Pesan Internal Jagel
         try {
             const detailJasa = body.jasaTambahan.length > 0 ? body.jasaTambahan.map(j => j.nama).join(', ') : "-";
-            
+
             await axios.post('https://api.jagel.id/v1/message/send', {
                 apikey: JAGEL_API_KEY,
                 type: 'email',
                 value: userEmail,
                 content: `✅ PEMBAYARAN BERHASIL (LUNAS)\n\n` +
-                         `Halo ${body.kontak.nama},\n` +
-                         `Pesanan #${partner_reff} telah lunas menggunakan Saldo.\n\n` +
-                         `Detail:\n` +
-                         `- Layanan: ${body.layanan.nama}\n` +
-                         `- Jasa Tambahan: ${detailJasa}\n` +
-                         `- Jadwal: ${body.jadwal.tanggal} ${body.jadwal.jam}\n` +
-                         `- Total: Rp${totalBayar.toLocaleString()}\n\n` +
-                         `Teknisi kami akan segera memproses pesanan Anda. Terima kasih!`
+                    `Halo ${body.kontak.nama},\n` +
+                    `Pesanan #${partner_reff} telah lunas menggunakan Saldo.\n\n` +
+                    `Detail:\n` +
+                    `- Layanan: ${body.layanan.nama}\n` +
+                    `- Jasa Tambahan: ${detailJasa}\n` +
+                    `- Jadwal: ${body.jadwal.tanggal} ${body.jadwal.jam}\n` +
+                    `- Total: Rp${totalBayar.toLocaleString()}\n\n` +
+                    `Teknisi kami akan segera memproses pesanan Anda. Terima kasih!`
             });
             console.log("✅ Notifikasi Jagel Terkirim");
         } catch (msgErr) {
@@ -449,6 +449,7 @@ app.post('/callback', async (req, res) => {
         }
 
         // 2. Cek status lunas (Cegah duplikasi)
+        // Jika sudah PAID, segera hentikan proses agar WA/Email tidak terkirim lagi
         if (orderData.order_status === 'PAID') {
             console.log(`ℹ️ Order #${reffFromCallback} sudah LUNAS.`);
             return res.json({ message: "Already Processed" });
@@ -462,7 +463,8 @@ app.post('/callback', async (req, res) => {
             `UPDATE ${logTable} SET status = 'SUKSES', callback_raw = ?, updated_at = NOW() WHERE partner_reff = ?`,
             [JSON.stringify(req.body), reffFromCallback]
         );
-        
+
+        // PENTING: Update status menjadi PAID di sini agar callback susulan tertolak di Poin 2
         await db.execute(
             `UPDATE order_service SET order_status = 'PAID', updated_at = NOW() WHERE order_reff = ?`,
             [reffFromCallback]
@@ -470,59 +472,46 @@ app.post('/callback', async (req, res) => {
 
         console.log(`✅ Order #${reffFromCallback} set to PAID. Preparing notifications...`);
 
-        // --- 4. OLAH DATA DETAIL (DIPERBAIKI: Query Join & Sanitasi) ---
-        
-        // Fungsi Sanitasi: Menghapus Tab, Newline, dan Spasi Ganda agar WA tidak Error
-        const cleanStr = (val) => {
-            if (!val) return "-";
-            return String(val)
-                .replace(/[\t\n\r]/g, ' ') // Ganti Tab/Enter jadi spasi biasa
-                .replace(/\s+/g, ' ')      // Gabungkan spasi ganda
-                .trim() || "-";
-        };
-
+        // 4. Olah Data Detail & Format Tanggal (Fix: Rabu, 28 Jan 2026)
         let detailJasa = "-";
-        try {
-            if (orderData.extra_services && orderData.extra_services !== "[]") {
-                const extraIds = JSON.parse(orderData.extra_services);
-                if (Array.isArray(extraIds) && extraIds.length > 0) {
-                    // Ambil nama addon dari tabel service_addons
-                    const [addons] = await db.query(
-                        'SELECT addon_name FROM service_addons WHERE id IN (?)',
-                        [extraIds]
-                    );
-                    if (addons && addons.length > 0) {
-                        detailJasa = addons.map(a => a.addon_name).join(', ');
-                    }
-                }
-            }
-        } catch (e) { 
-            console.error("⚠️ Gagal olah extra_services:", e.message);
-            detailJasa = "-"; 
+        if (orderData.extra_services) {
+            try {
+                const extras = JSON.parse(orderData.extra_services);
+                detailJasa = extras.length > 0 ? extras.map(i => i.nama).join(', ') : "-";
+            } catch (e) { detailJasa = "-"; }
         }
 
-        // Format Rupiah & Pembersihan Spasi Khusus (Non-breaking space)
         const totalFormatted = new Intl.NumberFormat('id-ID', {
             style: 'currency', currency: 'IDR', minimumFractionDigits: 0
-        }).format(orderData.total_amount || 0).replace(/\u00A0/g, ' ');
+        }).format(orderData.total_amount);
 
-        const tglJadwal = moment(orderData.schedule_date).locale('id').format('dddd, DD MMM YYYY');
-        const waktuJadwal = `${tglJadwal} pukul ${orderData.schedule_time || "-"} WIB`;
+        // 1. Definisikan Fallback jika tanggal kosong
+        const rawDate = orderData.schedule_date || new Date();
 
-        // --- 5. SIAPKAN VARIABEL WHATSAPP (DIPERBAIKI: Sangat Bersih) ---
+        // 2. Format dengan Moment
+        let tglJadwal = moment(rawDate).locale('id').format('dddd, DD MMM YYYY');
+
+        // 3. SANITASI TOTAL: Pastikan tidak ada "Invalid date" dan hapus karakter aneh
+        if (tglJadwal === "Invalid date") {
+            tglJadwal = "-"; // Atau format manual jika perlu
+        }
+
+        // Tambahan: Bersihkan spasi ganda atau karakter tab tersembunyi
+        tglJadwal = tglJadwal.replace(/\s+/g, ' ').trim();
+        const waktuJadwal = `${tglJadwal} pukul ${orderData.schedule_time} WIB`;
+
+        // 5. Siapkan Variabel WhatsApp
         const waVariables = {
-            "1": cleanStr(orderData.customer_name),
-            "2": cleanStr(orderData.order_reff),
-            "3": cleanStr(orderData.service_name),
-            "4": cleanStr(detailJasa),
-            "5": cleanStr(tglJadwal),
-            "6": cleanStr(orderData.schedule_time),
-            "7": cleanStr(totalFormatted)
+            "1": String(orderData.customer_name),
+            "2": String(orderData.order_reff),
+            "3": String(orderData.service_name),
+            "4": String(detailJasa),
+            "5": String(tglJadwal),
+            "6": String(orderData.schedule_time),
+            "7": String(totalFormatted)
         };
 
-        console.log("📤 Dispatching Notifications with Variables:", JSON.stringify(waVariables));
-
-        // --- TEMPLATE EMAIL E-RECEIPT (DIPERTAHANKAN SESUAI ASLI) ---
+        // --- TEMPLATE EMAIL E-RECEIPT ---
         const emailHtml = `
 <div style="font-family: sans-serif; color: #333; max-width: 600px; margin: auto; border: 1px solid #eee; padding: 20px; border-radius: 15px;">
     <div style="text-align: center; margin-bottom: 20px;">
@@ -562,13 +551,13 @@ app.post('/callback', async (req, res) => {
     </p>
 </div>`;
 
-        // --- 6. EKSEKUSI NOTIFIKASI ---
+        console.log("🚀 Dispatching Notifications...");
 
-        // 1. WhatsApp Pelanggan & Admin
+        // --- 1. KIRIM WA PELANGGAN & ADMIN ---
         await sendWhatsAppWithTemplate(orderData.customer_phone, waVariables);
         await sendWhatsAppWithTemplate(ADMIN_PHONE, waVariables);
 
-        // 2. Notifikasi Jagel (DIPERTAHANKAN)
+        // --- 2. NOTIFIKASI JAGEL (Lengkap) ---
         try {
             await axios.post('https://api.jagel.id/v1/message/send', {
                 apikey: "z4PBduE9ocedWaaTUCKHnOl7C8yokkTB4catk7FMt5U2d4Lmyv",
@@ -587,7 +576,7 @@ app.post('/callback', async (req, res) => {
             });
         } catch (e) { console.error("❌ Jagel Error:", e.message); }
 
-        // 3. Email Invoice
+        // --- 3. KIRIM EMAIL INVOICE ---
         if (orderData.customer_email) {
             await sendEmailNotification(orderData.customer_email, `E-Receipt Pembayaran Lunas #${reffFromCallback}`, emailHtml);
         }
@@ -650,16 +639,16 @@ app.get('/check-status/:partnerReff', async (req, res) => {
         });
 
         const linkquStatus = response.data;
-        
+
         // 3. Logika Update Database jika Lunas
         // Status '00' atau 'SUKSES' dari LinkQu berarti pembayaran berhasil
         if (linkquStatus.status_code === '00' || linkquStatus.status === 'SUKSES') {
             if (orderData.order_status === 'PENDING_PAYMENT') {
                 const table = orderData.payment_code === 'QRIS' ? 'inquiry_qris' : 'inquiry_va';
-                
+
                 await db.execute(`UPDATE ${table} SET status = 'SUKSES', updated_at = NOW() WHERE partner_reff = ?`, [partner_reff]);
                 await db.execute(`UPDATE order_service SET order_status = 'PAID', updated_at = NOW() WHERE order_reff = ?`, [partner_reff]);
-                
+
                 orderData.order_status = 'PAID'; // Update local variable for response
             }
         }
